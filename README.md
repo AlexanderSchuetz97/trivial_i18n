@@ -172,6 +172,38 @@ I am not opposed to adding support for different key-value resource file formats
 somewhat standardized and not 'custom'. There is no real reason for the proc macro to not support
 whatever key->value file format there is. Either make a pull request or open an issue on GitHub.
 
+## Working with RustRover
+RustRover will cache invocations of proc macros. This will cause problems because rust rover will
+not realize that you have added a new key to a properties file. This is a known problem
+in RustRover that has not been fixed for over a year by now. A lot of other crates that, for 
+example, generate code based on a schema file also have this problem.
+
+The only known workaround requires restarting the IDE. This is not that great.
+
+To mitigate this, as a workaround for this bug, you can optionally add a "serial" number to the proc macro invocation.
+You can increment this number to fool RustRover into re-evaluating the proc macro whenever you added or removed 
+a key from the properties file.
+
+Example:
+```rust
+mod i18n {
+    enum SupportedLanguages {
+        English,
+        German
+    }
+    
+    trivial_i18n::i18n! {
+        1234; //Completely ignored and serves no function other than to trick rust rover, must, however, be a u128 number.
+        SupportedLanguages;
+        English="i18n/ENGLISH.properties";
+        German="i18n/GERMAN.properties";
+    }
+}
+```
+
+It's up to you if you wish to keep this workaround number in your code or remove it before releasing/publishing
+your software. It has no impact on the generated code.
+
 ## Future work
 Adding support for templating. Java Resource Bundles support simple insertion templating,
 for example, a key/value like this:
