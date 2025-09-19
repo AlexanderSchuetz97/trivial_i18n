@@ -284,10 +284,10 @@ mod i18n {
             f.write_str(self.as_str())
         }
     }
-    pub fn set_i18n_language(language: crate::global_state::Language) {
+    pub fn set_i18n_language(language: SupportedLanguages) {
         SELECTION.store(match language {
-            crate::global_state::Language::English => 0,
-            crate::global_state::Language::German => 1,
+            SupportedLanguages::English => 0,
+            SupportedLanguages::German => 1,
             _ => 0,
         } as u32, core::sync::atomic::Ordering::Relaxed);
     }
