@@ -1,9 +1,13 @@
+use crate::x::I18NFormatParameter;
 use linked_hash_map::LinkedHashMap;
-use proc_macro::{TokenStream, TokenTree};
 use proc_macro::token_stream::IntoIter;
-use std::collections::HashMap;
+use proc_macro::{TokenStream, TokenTree};
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::fmt::{Display, Write};
 use std::fs::File;
 use std::io::BufReader;
+use std::mem;
+use std::ops::{Deref, Index};
 use std::path::Path;
 
 #[derive(Debug, Clone)]
@@ -12,6 +16,7 @@ struct Variant {
     path: String,
     fallbacks: Vec<String>,
     properties: HashMap<String, String>,
+    complex_properties: HashMap<String, Vec<(String, usize)>>
 }
 
 fn parse_path(input: &mut IntoIter) -> String {
@@ -92,10 +97,6 @@ pub fn i18n(input: TokenStream) -> TokenStream {
 
     let default_path = lit.to_string();
 
-    eprintln!("language {}", &language_name);
-    eprintln!("default language {}", &default_variant);
-    eprintln!("default language path {}", &default_path);
-
     let mut variants = LinkedHashMap::new();
 
     variants.insert(
@@ -105,6 +106,7 @@ pub fn i18n(input: TokenStream) -> TokenStream {
             path: default_path,
             fallbacks: vec![],
             properties: Default::default(),
+            complex_properties: Default::default(),
         },
     );
 
@@ -174,6 +176,7 @@ pub fn i18n(input: TokenStream) -> TokenStream {
                 path: variant_path,
                 fallbacks,
                 properties: Default::default(),
+                complex_properties: Default::default(),
             },
         );
     }
@@ -199,49 +202,138 @@ pub fn i18n(input: TokenStream) -> TokenStream {
     validate_fallbacks_exist(&mut variants);
     validate_all_keys_in_default_language(&default_variant, &mut variants);
     resolve_fallbacks_properties(&default_variant, &mut variants);
-
-    for (_name, v) in &variants {
-        eprintln!("{:?}", v)
-    }
+    sort_properties(&mut variants);
+    let complexity = find_max_complexity(&variants);
+    let all_complexity = find_all_complexity(&variants);
 
     let mut output = String::with_capacity(0x4_00_00);
     output.push_str("static SELECTION: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);\n");
-    output.push_str("#[derive(Debug, Copy, Clone)]");
+
+    output.push_str("pub trait I18NFormatParameter<const MAX_INDEX: usize> {\n");
+    output.push_str("fn format_parameter(&self, idx: usize, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result;\n");
+    output.push_str("}\n");
+
+    output.push_str("impl I18NFormatParameter<0> for () {\n");
+    output.push_str("fn format_parameter(&self, idx: usize, f: &mut core::fmt::Formatter<'_>) -> std::fmt::Result {\n");
+    output.push_str("Ok(())\n");
+    output.push_str("}\n");
+    output.push_str("}\n");
+
+    output.push_str("impl<const MAX_INDEX: usize, T: core::fmt::Display> I18NFormatParameter<MAX_INDEX> for &[T] {\n");
+    output.push_str("fn format_parameter(&self, idx: usize, f: &mut core::fmt::Formatter<'_>) -> std::fmt::Result {\n");
+    output.push_str("let Some(dsp) = self.get(idx) else {\n");
+    output.push_str("return Ok(());\n");
+    output.push_str("};\n");
+    output.push_str("core::fmt::Display::fmt(dsp, f)\n");
+    output.push_str("}\n");
+    output.push_str("}\n");
+
+    for k in all_complexity {
+        if k == 0 {
+            continue;
+        }
+        fn mk_arg_impl(output: &mut String, k: usize, prefix: &str) {
+            output.push_str("impl<");
+
+            for n in 0..k {
+                output.push_str(&format!("D{}: core::fmt::Display, ", n));
+            }
+
+            output.push_str("> I18NFormatParameter<");
+            output.push_str(k.to_string().as_str());
+            output.push_str("> for ");
+            output.push_str(prefix);
+            output.push_str("(");
+
+            for n in 0..k {
+                output.push_str(&format!("D{}, ", n));
+            }
+            output.push_str(") {\n");
+            output.push_str("fn format_parameter(&self, idx: usize, f: &mut core::fmt::Formatter<'_>) -> std::fmt::Result {\n");
+            output.push_str("match(idx) {\n");
+            for n in 0..k {
+                output.push_str(n.to_string().as_str());
+                output.push_str(" => core::fmt::Display::fmt(&self.");
+                output.push_str(n.to_string().as_str());
+                output.push_str(", f),");
+            }
+            output.push_str("_=> Ok(())\n");
+            output.push_str("}\n");
+            output.push_str("}\n");
+            output.push_str("}\n");
+        }
+
+        mk_arg_impl(&mut output, k, "");
+        mk_arg_impl(&mut output, k, "&");
+    }
+
+    output.push_str("#[derive(Debug, Copy, Clone)]\n");
     output.push_str(
         format!(
-            "pub struct I18NValue(&'static [&'static str; {}]);\n",
+            "pub struct I18NValue<const MAX_INDEX: usize>(&'static [(&'static str, &'static [(&'static str, usize)]); {}]);\n",
             variants.len()
         )
         .as_str(),
     );
-    output.push_str("impl I18NValue {\n");
+    output.push_str("impl<const MAX_INDEX: usize> I18NValue<MAX_INDEX> {\n");
     output.push_str("pub fn as_str(&self) -> &'static str {\n");
-    output.push_str("self.0[SELECTION.load(core::sync::atomic::Ordering::Relaxed) as usize]\n");
+    output.push_str("self.0[SELECTION.load(core::sync::atomic::Ordering::Relaxed) as usize].0\n");
     output.push_str("}\n");
     output.push_str("pub const fn default_str(&self) -> &'static str {\n");
-    output.push_str("self.0[0]\n");
-    output.push_str("}\n");
+    output.push_str("self.0[0].0\n");
     output.push_str("}\n");
 
-    output.push_str("impl AsRef<str> for I18NValue {\n");
+    output.push_str("pub fn format_with<T: >(&self, arg: impl I18NFormatParameter<MAX_INDEX>, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {\n");
+    output.push_str("for (prefix, arg_index) in self.0[SELECTION.load(core::sync::atomic::Ordering::Relaxed) as usize].1 {\n");
+    output.push_str("let idx = *arg_index;\n");
+    output.push_str("f.write_str(prefix)?;\n");
+    output.push_str("if idx != usize::MAX {\n");
+    output.push_str("arg.format_parameter(idx, f)?;\n");
+    output.push_str("}\n");
+    output.push_str("}\n");
+    output.push_str("Ok(())\n");
+    output.push_str("}\n");
+
+    output.push_str("pub fn format(&self, arg: impl I18NFormatParameter<MAX_INDEX>) -> String {\n");
+    output.push_str("struct FMT<'a, const M: usize, T: I18NFormatParameter<M>>(&'a I18NValue<M>, T);\n");
+    output.push_str("impl<const M: usize, T: I18NFormatParameter<M>> core::fmt::Display for FMT<'_, M, T> {\n");
+    output.push_str("fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> std::fmt::Result {\n");
+    output.push_str("for (prefix, arg_index) in self.0.0[SELECTION.load(core::sync::atomic::Ordering::Relaxed) as usize].1 {\n");
+    output.push_str("let idx = *arg_index;\n");
+    output.push_str("f.write_str(prefix)?;\n");
+    output.push_str("if idx != usize::MAX {\n");
+    output.push_str("self.1.format_parameter(idx, f)?;\n");
+    output.push_str("}\n");
+    output.push_str("}\n");
+    output.push_str("Ok(())\n");
+    output.push_str("}\n");
+    output.push_str("}\n");
+    output.push_str("let formatter = FMT(self, arg);\n");
+    output.push_str("ToString::to_string(&formatter)\n");
+    output.push_str("}\n");
+
+
+    output.push_str("}\n");
+
+    output.push_str("impl<const MAX_INDEX: usize> AsRef<str> for I18NValue<MAX_INDEX> {\n");
     output.push_str("fn as_ref(&self) -> &str {\n");
     output.push_str("self.as_str()\n");
     output.push_str("}\n");
     output.push_str("}\n");
 
-    output.push_str("impl From<I18NValue> for String {\n");
-    output.push_str("fn from(value: I18NValue) -> String {\n");
+    output.push_str("impl<const MAX_INDEX: usize> From<I18NValue<MAX_INDEX>> for String {\n");
+    output.push_str("fn from(value: I18NValue<MAX_INDEX>) -> String {\n");
     output.push_str("value.as_str().to_string()\n");
     output.push_str("}\n");
     output.push_str("}\n");
 
-    output.push_str("impl From<I18NValue> for &'static str {\n");
-    output.push_str("fn from(value: I18NValue) -> &'static str {\n");
+    output.push_str("impl<const MAX_INDEX: usize> From<I18NValue<MAX_INDEX>> for &'static str {\n");
+    output.push_str("fn from(value: I18NValue<MAX_INDEX>) -> &'static str {\n");
     output.push_str("value.as_str()\n");
     output.push_str("}\n");
     output.push_str("}\n");
 
-    output.push_str("impl core::fmt::Display for I18NValue {\n");
+    output.push_str("impl<const MAX_INDEX: usize> core::fmt::Display for I18NValue<MAX_INDEX> {\n");
     output.push_str(" fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {\n");
     output.push_str("f.write_str(self.as_str())\n");
     output.push_str("}\n");
@@ -256,27 +348,55 @@ pub fn i18n(input: TokenStream) -> TokenStream {
     output.push_str("} as u32, core::sync::atomic::Ordering::Relaxed);\n");
     output.push_str("}\n");
 
-    for k in variants.get(&default_variant).unwrap().properties.keys() {
-        output.push_str(format!("pub static {k}: I18NValue = I18NValue(&[").as_str());
+    let keys_sorted: BTreeSet<String> = variants.get(&default_variant).unwrap().properties.keys().cloned().collect();
+
+    for k in &keys_sorted {
+        let comp = complexity.get(k).unwrap().clone();
+        output.push_str(format!("pub static {k}: I18NValue<{comp}> = I18NValue(&[").as_str());
         for (_, value) in variants.iter() {
-            let prop_val = value
+            let prop_val = escape_string_for_source(value
                 .properties
                 .get(k)
-                .unwrap()
-                .replace("\n", "\\n")
-                .replace("\r", "\\r")
-                .replace("\t", "\\t")
-                .replace("\"", "\\\"")
-                .replace("\\", "\\\\");
+                .unwrap());
+
+            output.push_str("(");
             output.push_str("\"");
             output.push_str(prop_val.as_str());
             output.push_str("\",");
+            if let Some(complex) = value.complex_properties.get(k) {
+                output.push_str("&[");
+                for (prefix, index) in complex {
+                    let prefix = escape_string_for_source(prefix);
+                    output.push_str("(\"");
+                    output.push_str(prefix.as_str());
+                    if *index == usize::MAX {
+                        output.push_str("\", usize::MAX), ");
+                    } else {
+                        output.push_str("\", ");
+                        output.push_str(index.to_string().as_str());
+                        output.push_str("), ");
+                    }
+                }
+                output.push_str("]");
+            } else {
+                output.push_str("&[]");
+            }
+
+            output.push_str("),");
         }
         output.push_str("]);\n");
     }
 
     eprintln!("{}", &output);
     output.parse().unwrap()
+}
+
+fn escape_string_for_source(input: &str) -> String {
+    input.replace("\n", "\\n")
+        .replace("\r", "\\r")
+        .replace("\t", "\\t")
+        .replace("\"", "\\\"")
+        .replace("\\", "\\\\")
 }
 
 fn validate_fallbacks_exist(variants: &mut LinkedHashMap<String, Variant>) {
@@ -340,4 +460,244 @@ fn resolve_fallbacks_properties(
         //Replace the processed lang in the lookup map, we process them in natural order.
         cl.insert(variant.name.clone(), variant.clone());
     }
+}
+
+fn sort_properties(variants: &mut LinkedHashMap<String, Variant>) {
+    let mut complex = HashSet::new();
+    for (_, variant) in variants.iter_mut() {
+        for (k, v) in variant.properties.iter() {
+            let mut g = v.chars();
+            let mut buf = String::new();
+            while let Some(n) = g.next() {
+                if n != '{' {
+                    continue;
+                }
+
+                let Some(n) = g.next() else {
+                    continue;
+                };
+
+                if !n.is_ascii_digit() {
+                    continue;
+                }
+
+                buf.push(n);
+
+                while let Some(n) = g.next() {
+                    if n.is_ascii_digit() {
+                        buf.push(n);
+                        continue;
+                    }
+
+                    if n == '}' {
+                        if buf.parse::<usize>().is_ok() {
+                            complex.insert(k.to_string());
+                        }
+                    }
+                    buf.clear();
+                    break;
+                }
+            }
+        }
+    }
+
+
+    for (_, variant) in variants.iter_mut() {
+        for (k, v) in variant.properties.iter() {
+            let mut res = Vec::new();
+            let mut iter = v.chars();
+            let mut kbuf = String::new();
+            while let Some(n) = iter.next() {
+                if n != '{' {
+                    kbuf.push(n);
+                    continue;
+                }
+
+                let Some(n) = iter.next() else {
+                    kbuf.push('{');
+                    continue;
+                };
+
+                if !n.is_ascii_digit() {
+                    kbuf.push('{');
+                    kbuf.push(n);
+                    continue;
+                }
+
+                let mut nbuf = String::new();
+                nbuf.push(n);
+
+                while let Some(n) = iter.next() {
+                    if n.is_ascii_digit() {
+                        nbuf.push(n);
+                        continue;
+                    }
+
+                    if n == '}' {
+                        if let Ok(idx) = nbuf.parse::<usize>() {
+                            res.push((mem::take(&mut kbuf), idx));
+                            break;
+                        }
+                    }
+
+                    kbuf.push('{');
+                    kbuf.push_str(nbuf.as_str());
+                    kbuf.push(n);
+                    break;
+                }
+            }
+
+            if !kbuf.is_empty() {
+                res.push((mem::take(&mut kbuf), usize::MAX));
+            }
+
+            variant.complex_properties.insert(k.to_string(), res);
+        }
+    }
+}
+
+fn find_max_complexity(variants: &LinkedHashMap<String, Variant>) -> HashMap<String, usize> {
+    let mut res = HashMap::new();
+    for (_, variant) in variants.iter() {
+        for (k, v) in variant.properties.iter() {
+            res.insert(k.to_string(), 0);
+        }
+    }
+
+    for (_, variant) in variants.iter() {
+        for (k, v) in variant.complex_properties.iter() {
+            let max = res.get_mut(k).unwrap();
+            for (_, param) in v {
+                if *param == usize::MAX {
+                    continue;
+                }
+
+                if *max < (*param) + 1 {
+                    *max = (*param) + 1;
+                }
+            }
+        }
+    }
+
+    res
+}
+
+fn find_all_complexity(variants: &LinkedHashMap<String, Variant>) -> BTreeSet<usize> {
+    let mut res = BTreeSet::new();
+    res.insert(0);
+
+    for (_, variant) in variants.iter() {
+        for (k, v) in variant.complex_properties.iter() {
+            let mut max = 0;
+            for (_, param) in v {
+                if *param == usize::MAX {
+                    continue;
+                }
+
+                if max < (*param) + 1 {
+                    max = (*param) + 1;
+                }
+            }
+
+            res.insert(max);
+        }
+    }
+
+    res
+}
+
+
+mod global_state {
+    pub enum Language {
+        English,
+        German
+    }
+}
+mod x {
+    static SELECTION: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+    pub trait I18NFormatParameter<const MAX_INDEX: usize> {
+        fn format_parameter(&self, idx: usize, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result;
+    }
+    impl I18NFormatParameter<0> for () {
+        fn format_parameter(&self, idx: usize, f: &mut core::fmt::Formatter<'_>) -> std::fmt::Result {
+            Ok(())
+        }
+    }
+    impl<const MAX_INDEX: usize, T: core::fmt::Display> I18NFormatParameter<MAX_INDEX> for &[T] {
+        fn format_parameter(&self, idx: usize, f: &mut core::fmt::Formatter<'_>) -> std::fmt::Result {
+            let Some(dsp) = self.get(idx) else {
+                return Ok(());
+            };
+            core::fmt::Display::fmt(dsp, f)
+        }
+    }
+    #[derive(Debug, Copy, Clone)]
+    pub struct I18NValue<const MAX_INDEX: usize>(&'static [(&'static str, &'static [(&'static str, usize)]); 2]);
+    impl<const MAX_INDEX: usize> I18NValue<MAX_INDEX> {
+        pub fn as_str(&self) -> &'static str {
+            self.0[SELECTION.load(core::sync::atomic::Ordering::Relaxed) as usize].0
+        }
+        pub const fn default_str(&self) -> &'static str {
+            self.0[0].0
+        }
+        pub fn format_with<T: >(&self, arg: impl I18NFormatParameter<MAX_INDEX>, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            for (prefix, arg_index) in self.0[SELECTION.load(core::sync::atomic::Ordering::Relaxed) as usize].1 {
+                let idx = *arg_index;
+                f.write_str(prefix)?;
+                if idx != usize::MAX {
+                    arg.format_parameter(idx, f)?;
+                }
+            }
+            Ok(())
+        }
+        pub fn format(&self, arg: impl I18NFormatParameter<MAX_INDEX>) -> String {
+            struct FMT<'a, const M: usize, T: I18NFormatParameter<M>>(&'a I18NValue<M>, T);
+            impl<const M: usize, T: I18NFormatParameter<M>> core::fmt::Display for FMT<'_, M, T> {
+                fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> std::fmt::Result {
+                    for (prefix, arg_index) in self.0.0[SELECTION.load(core::sync::atomic::Ordering::Relaxed) as usize].1 {
+                        let idx = *arg_index;
+                        f.write_str(prefix)?;
+                        if idx != usize::MAX {
+                            self.1.format_parameter(idx, f)?;
+                        }
+                    }
+                    Ok(())
+                }
+            }
+            let formatter = FMT(self, arg);
+            ToString::to_string(&formatter)
+        }
+    }
+    impl<const MAX_INDEX: usize> AsRef<str> for I18NValue<MAX_INDEX> {
+        fn as_ref(&self) -> &str {
+            self.as_str()
+        }
+    }
+    impl<const MAX_INDEX: usize> From<I18NValue<MAX_INDEX>> for String {
+        fn from(value: I18NValue<MAX_INDEX>) -> String {
+            value.as_str().to_string()
+        }
+    }
+    impl<const MAX_INDEX: usize> From<I18NValue<MAX_INDEX>> for &'static str {
+        fn from(value: I18NValue<MAX_INDEX>) -> &'static str {
+            value.as_str()
+        }
+    }
+    impl<const MAX_INDEX: usize> core::fmt::Display for I18NValue<MAX_INDEX> {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            f.write_str(self.as_str())
+        }
+    }
+    pub fn set_i18n_language(language: crate::global_state::Language) {
+        SELECTION.store(match language {
+            crate::global_state::Language::English => 0,
+            crate::global_state::Language::German => 1,
+            _ => 0,
+        } as u32, core::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub static HELLO_WORLD: I18NValue<0> = I18NValue(&[("Hello World!",&[("Hello World!", usize::MAX), ]),("Hallo Welt!",&[("Hallo Welt!", usize::MAX), ]),]);
+    pub static WELD_SEAM: I18NValue<0> = I18NValue(&[("Weld seam",&[("Weld seam", usize::MAX), ]),("Schweißnaht",&[("Schweißnaht", usize::MAX), ]),]);
+    pub static MOUNTAIN: I18NValue<0> = I18NValue(&[("Mountain",&[("Mountain", usize::MAX), ]),("Mountain",&[("Mountain", usize::MAX), ]),]);
+
 }

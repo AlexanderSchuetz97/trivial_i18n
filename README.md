@@ -1,6 +1,7 @@
 # trivial_i18n
 Trivially simple no-std compile time i18n processor, with 0 runtime dependencies.
 
+The generated code supports language switching at runtime.
 ## Usage
 ```rust
 mod i18n {
@@ -85,80 +86,7 @@ The compilation target needs to support AtomicU32 as well as Alloc. STD is not r
 
 There are no other runtime dependencies.
 
-## What does the proc-macro generate?
-This
-```rust
-mod i18n {
-    enum SupportedLanguages {
-        English,
-        German
-    }
-    
-    trivial_i18n::i18n! {
-        SupportedLanguages;
-        English="i18n/ENGLISH.properties";
-        German="i18n/GERMAN.properties";
-    }
-}
-```
-expands to
-```rust
-mod i18n {
-    enum SupportedLanguages {
-        English,
-        German
-    }
 
-    static SELECTION: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-    
-    #[derive(Debug, Copy, Clone)]
-    pub struct I18NValue(&'static [&'static str; 2]);
-    
-    impl I18NValue {
-        pub fn as_str(&self) -> &'static str {
-            self.0[SELECTION.load(core::sync::atomic::Ordering::Relaxed) as usize]
-        }
-        pub const fn default_str(&self) -> &'static str {
-            self.0[0]
-        }
-    }
-    
-    impl AsRef<str> for I18NValue {
-        fn as_ref(&self) -> &str {
-            self.as_str()
-        }
-    }
-    impl From<I18NValue> for String {
-        fn from(value: I18NValue) -> String {
-            value.as_str().to_string()
-        }
-    }
-    
-    impl From<I18NValue> for &'static str {
-        fn from(value: I18NValue) -> &'static str {
-            value.as_str()
-        }
-    }
-    
-    impl core::fmt::Display for I18NValue {
-        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-            f.write_str(self.as_str())
-        }
-    }
-    
-    pub fn set_i18n_language(language: SupportedLanguages) {
-        SELECTION.store(match language {
-            SupportedLanguages::English => 0,
-            SupportedLanguages::German => 1,
-            _ => 0,
-        } as u32, core::sync::atomic::Ordering::Relaxed);
-    }
-    
-    pub static HELLO_WORLD: I18NValue = I18NValue(&["Hello World!","Hallo Welt!"]);
-    pub static WELD_SEAM: I18NValue = I18NValue(&["Weld seam","Schweißnaht"]);
-    pub static MOUNTAIN: I18NValue = I18NValue(&["Mountain","Mountain"]);
-}
-```
 ## Why a ".properties" file
 Because that is what Java Resource Bundles use and translation companies usually know how to deal with it
 since it has been around for the better part of 20 years by now.
@@ -204,11 +132,168 @@ mod i18n {
 It's up to you if you wish to keep this workaround number in your code or remove it before releasing/publishing
 your software. It has no impact on the generated code.
 
-## Future work
-Adding support for templating. Java Resource Bundles support simple insertion templating,
-for example, a key/value like this:
+## Simple Templating
+Java has a class called MessageFormat.
+It is often used together with resource bundles,
+while MessageFormat has a lot of features, most remain unused.
+It's primarily used for templating using simple substitution.
+
+This crate automatically supports this simple substitution; 
+however, it does not support more complex MessageFormat arguments.
+
+Example
+```
+GREETING=Hello {0}! Today is {1}! Have a nice day!
+```
+
+```rust
+fn test() {
+    let formatted : String = i18n::GREETING.format(("John", "Tuesday"));
+    assert_eq!("Hello John! Today is Tuesday! Have a nice day!", &formatted);
+    let formatted2 = i18n::GREETING.format(&["John", "Tuesday"]);
+    assert_eq!(&formatted, &formatted2);
+    
+    //If you are uninterested in using the format function, you can also access the key normally like any other regular key.
+    assert_eq!("Hello {0}! Today is {1}! Have a nice day!", i18n::GREETING.as_str());
+
+}
+```
+
+there is also a fn called `format_with` which accepts the string tuple as well as a `&mut core::fmt::Formatter`
+its intended to be used within Display implementations.
+
+In general, the format function accepts a slice of any length or a tuple of a matching length.
+The implementation does NOT panic if the slice is too small. It will simply substitute the indices which would be too large with empty string.
+If the number of elements is known, then using tuples instead of slices is preferable because the compiler emits a compiler error if the number 
+of elements in the tuple does NOT match the number of expected parameters.
+
+The elements in the Tuple/Slice can be any element that implements Display.
+
+### Single parameter templating
+Unfortunately, the format function does not accept a non-tuple single Display argument due to rust trait constraints.
+This means to format a message with exactly one argument you have to use this syntax:
+
+Example
 ```
 GREETING=Hello {0}! Have a nice day!
 ```
-Would receive a String parameter, in this case the name of a person.
-This still has to be supported by trivial_i18n.
+
+```rust
+fn test() {
+    //The comma after "John" is important, it won't compile without it.
+    let formatted : String = i18n::GREETING.format(("John", ));
+    assert_eq!("Hello John! Have a nice day!");
+}
+```
+
+## What does the proc-macro generate?
+This
+```rust
+mod i18n {
+    enum SupportedLanguages {
+        English,
+        German
+    }
+    
+    trivial_i18n::i18n! {
+        SupportedLanguages;
+        English="i18n/ENGLISH.properties";
+        German="i18n/GERMAN.properties";
+    }
+}
+```
+expands to
+```rust
+mod i18n {
+    enum SupportedLanguages {
+        English,
+        German
+    }
+
+    static SELECTION: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+    pub trait I18NFormatParameter<const MAX_INDEX: usize> {
+        fn format_parameter(&self, idx: usize, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result;
+    }
+    impl I18NFormatParameter<0> for () {
+        fn format_parameter(&self, idx: usize, f: &mut core::fmt::Formatter<'_>) -> std::fmt::Result {
+            Ok(())
+        }
+    }
+    impl<const MAX_INDEX: usize, T: core::fmt::Display> I18NFormatParameter<MAX_INDEX> for &[T] {
+        fn format_parameter(&self, idx: usize, f: &mut core::fmt::Formatter<'_>) -> std::fmt::Result {
+            let Some(dsp) = self.get(idx) else {
+                return Ok(());
+            };
+            core::fmt::Display::fmt(dsp, f)
+        }
+    }
+    #[derive(Debug, Copy, Clone)]
+    pub struct I18NValue<const MAX_INDEX: usize>(&'static [(&'static str, &'static [(&'static str, usize)]); 2]);
+    impl<const MAX_INDEX: usize> I18NValue<MAX_INDEX> {
+        pub fn as_str(&self) -> &'static str {
+            self.0[SELECTION.load(core::sync::atomic::Ordering::Relaxed) as usize].0
+        }
+        pub const fn default_str(&self) -> &'static str {
+            self.0[0].0
+        }
+        pub fn format_with<T: >(&self, arg: impl I18NFormatParameter<MAX_INDEX>, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            for (prefix, arg_index) in self.0[SELECTION.load(core::sync::atomic::Ordering::Relaxed) as usize].1 {
+                let idx = *arg_index;
+                f.write_str(prefix)?;
+                if idx != usize::MAX {
+                    arg.format_parameter(idx, f)?;
+                }
+            }
+            Ok(())
+        }
+        pub fn format(&self, arg: impl I18NFormatParameter<MAX_INDEX>) -> String {
+            struct FMT<'a, const M: usize, T: I18NFormatParameter<M>>(&'a I18NValue<M>, T);
+            impl<const M: usize, T: I18NFormatParameter<M>> core::fmt::Display for FMT<'_, M, T> {
+                fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> std::fmt::Result {
+                    for (prefix, arg_index) in self.0.0[SELECTION.load(core::sync::atomic::Ordering::Relaxed) as usize].1 {
+                        let idx = *arg_index;
+                        f.write_str(prefix)?;
+                        if idx != usize::MAX {
+                            self.1.format_parameter(idx, f)?;
+                        }
+                    }
+                    Ok(())
+                }
+            }
+            let formatter = FMT(self, arg);
+            ToString::to_string(&formatter)
+        }
+    }
+    impl<const MAX_INDEX: usize> AsRef<str> for I18NValue<MAX_INDEX> {
+        fn as_ref(&self) -> &str {
+            self.as_str()
+        }
+    }
+    impl<const MAX_INDEX: usize> From<I18NValue<MAX_INDEX>> for String {
+        fn from(value: I18NValue<MAX_INDEX>) -> String {
+            value.as_str().to_string()
+        }
+    }
+    impl<const MAX_INDEX: usize> From<I18NValue<MAX_INDEX>> for &'static str {
+        fn from(value: I18NValue<MAX_INDEX>) -> &'static str {
+            value.as_str()
+        }
+    }
+    impl<const MAX_INDEX: usize> core::fmt::Display for I18NValue<MAX_INDEX> {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            f.write_str(self.as_str())
+        }
+    }
+    pub fn set_i18n_language(language: crate::global_state::Language) {
+        SELECTION.store(match language {
+            crate::global_state::Language::English => 0,
+            crate::global_state::Language::German => 1,
+            _ => 0,
+        } as u32, core::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub static HELLO_WORLD: I18NValue<0> = I18NValue(&[("Hello World!",&[("Hello World!", usize::MAX), ]),("Hallo Welt!",&[("Hallo Welt!", usize::MAX), ]),]);
+    pub static WELD_SEAM: I18NValue<0> = I18NValue(&[("Weld seam",&[("Weld seam", usize::MAX), ]),("Schweißnaht",&[("Schweißnaht", usize::MAX), ]),]);
+    pub static MOUNTAIN: I18NValue<0> = I18NValue(&[("Mountain",&[("Mountain", usize::MAX), ]),("Mountain",&[("Mountain", usize::MAX), ]),]);
+}
+```
