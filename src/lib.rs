@@ -24,7 +24,9 @@ use std::fs::File;
 use std::io::BufReader;
 use std::mem;
 use std::path::Path;
+use std::fmt::Write;
 
+/// Struct that holds data associated with a single language variant.
 #[derive(Debug, Clone)]
 struct Variant {
     /// Language name
@@ -65,9 +67,50 @@ fn parse_path(input: &mut IntoIter) -> String {
     language_name
 }
 
+/// Makes an impl for a tuple with k elements into a format arg.
+fn mk_arg_impl(output: &mut String, k: usize, prefix: &str) {
+    output.push_str("impl<");
+
+    for n in 0..k {
+        _= write!(output, "D{n}: core::fmt::Display, ");
+    }
+
+    output.push_str("> I18NFormatParameter<");
+    output.push_str(k.to_string().as_str());
+    output.push_str("> for ");
+    output.push_str(prefix);
+    output.push('(');
+
+    for n in 0..k {
+        let _ = write!(output, "D{n}, ");
+    }
+    output.push_str(") {\n");
+    output.push_str("fn format_parameter(&self, idx: usize, f: &mut core::fmt::Formatter<'_>) -> std::fmt::Result {\n");
+    output.push_str("match(idx) {\n");
+    for n in 0..k {
+        output.push_str(n.to_string().as_str());
+        output.push_str(" => core::fmt::Display::fmt(&self.");
+        output.push_str(n.to_string().as_str());
+        output.push_str(", f),");
+    }
+    output.push_str("_=> Ok(())\n");
+    output.push_str("}\n");
+    output.push_str("}\n");
+    output.push_str("}\n");
+}
+
+///
+/// Generate i18n key/value pairs from the .properties files referenced
+/// in the macro invocation.
+///
+/// # Panics
+/// if the syntax of the proc macro invocation is not correct or the properties files referenced cant be read.
+///
 #[proc_macro]
 pub fn i18n(input: TokenStream) -> TokenStream {
     let mut token_iter: IntoIter = input.into_iter();
+
+    let mut variants = LinkedHashMap::new();
 
     let mut language_name = parse_path(&mut token_iter);
 
@@ -77,50 +120,7 @@ pub fn i18n(input: TokenStream) -> TokenStream {
 
     assert!(!language_name.is_empty(), "Trying to parse language name but no language name supplied.");
 
-    let Some(TokenTree::Ident(lit)) = token_iter.next() else {
-        panic!("Trying to parse language default enum name, a ident, but got non ident.");
-    };
-
-    let default_variant = lit.to_string();
-
-    let Some(TokenTree::Punct(p)) = token_iter.next() else {
-        panic!("Trying to parse = after default language enum name, but got non Punct TokenTree");
-    };
-
-    assert!((p.as_char() == '='), 
-            "Trying to parse = after default language enum name, but got {}",
-            p.as_char()
-        );
-
-    assert!(!default_variant.is_empty(), "Trying to parse language default variant but got empty token tree.");
-
-    let Some(TokenTree::Literal(lit)) = token_iter.next() else {
-        panic!("Trying to parse language default file path, a literal, but got non literal.");
-    };
-
-    let Some(TokenTree::Punct(p)) = token_iter.next() else {
-        panic!("Trying to parse ; after language default file path, but got non Punct TokenTree");
-    };
-
-    assert!((p.as_char() == ';'), 
-            "Trying to parse ; after language default file path, but got {}",
-            p.as_char()
-        );
-
-    let default_path = lit.to_string();
-
-    let mut variants = LinkedHashMap::new();
-
-    variants.insert(
-        default_variant.clone(),
-        Variant {
-            name: default_variant.clone(),
-            path: default_path,
-            fallbacks: vec![],
-            properties: Default::default(),
-            properties_split_by_format_args: Default::default(),
-        },
-    );
+    let default_variant = parse_default_variant(&mut token_iter, &mut variants);
 
     while let Some(next) = token_iter.next() {
         let TokenTree::Ident(lit) = next else {
@@ -160,10 +160,7 @@ pub fn i18n(input: TokenStream) -> TokenStream {
                 break;
             }
 
-            assert!((p.as_char() == ','), 
-                    "Trying to parse ; or , after language {variant_name} file path {variant_path}, but got {}",
-                    p.as_char()
-                );
+            assert_eq!(p.as_char(), ',', "Trying to parse ; or , after language {variant_name} file path {variant_path}, but got {}", p.as_char());
 
             match token_iter.next() {
                 Some(TokenTree::Ident(lit)) => {
@@ -183,17 +180,81 @@ pub fn i18n(input: TokenStream) -> TokenStream {
                 name: variant_name,
                 path: variant_path,
                 fallbacks,
-                properties: Default::default(),
-                properties_split_by_format_args: Default::default(),
+                properties: HashMap::default(),
+                properties_split_by_format_args: HashMap::default(),
             },
         );
     }
 
-    for (_, variant) in &mut variants {
+    read_property_files(&mut variants);
+    validate_fallbacks_exist(&variants);
+    validate_all_keys_in_default_language(&default_variant, &variants);
+    resolve_fallbacks_properties(&default_variant, &mut variants);
+    parse_property_values_for_substitution_format(&mut variants);
+
+    let output = generate_output(&language_name, &default_variant, &variants);
+
+    eprintln!("{}", &output);
+    match output.parse::<TokenStream>() {
+        Ok(e) => e,
+        Err(r) => panic!("Generated rust source code is invalid\n {output}\n error={r}"),
+    }
+}
+
+/// Parses the default variant from the token stream and add it to the variant list.
+/// returns the name of the default variant.
+fn parse_default_variant(token_iter: &mut IntoIter, variants: &mut LinkedHashMap<String, Variant>) -> String {
+    let Some(TokenTree::Ident(lit)) = token_iter.next() else {
+        panic!("Trying to parse language default enum name, a ident, but got non ident.");
+    };
+
+    let default_variant = lit.to_string();
+
+    let Some(TokenTree::Punct(p)) = token_iter.next() else {
+        panic!("Trying to parse = after default language enum name, but got non Punct TokenTree");
+    };
+
+    assert!((p.as_char() == '='),
+            "Trying to parse = after default language enum name, but got {}",
+            p.as_char()
+    );
+
+    assert!(!default_variant.is_empty(), "Trying to parse language default variant but got empty token tree.");
+
+    let Some(TokenTree::Literal(lit)) = token_iter.next() else {
+        panic!("Trying to parse language default file path, a literal, but got non literal.");
+    };
+
+    let Some(TokenTree::Punct(p)) = token_iter.next() else {
+        panic!("Trying to parse ; after language default file path, but got non Punct TokenTree");
+    };
+
+    assert_eq!(p.as_char(), ';', "Trying to parse ; after language default file path, but got {}", p.as_char());
+
+    let default_path = lit.to_string();
+
+
+    variants.insert(
+        default_variant.clone(),
+        Variant {
+            name: default_variant.clone(),
+            path: default_path,
+            fallbacks: vec![],
+            properties: HashMap::default(),
+            properties_split_by_format_args: HashMap::default(),
+        },
+    );
+
+    default_variant
+}
+
+/// Read all the property files for the variants.
+fn read_property_files(variants: &mut LinkedHashMap<String, Variant>) {
+    for (_, variant) in variants {
         let path = Path::new(&variant.path[1..variant.path.len() - 1]);
         let mut prop_file_reader = BufReader::new(
             File::open(path).unwrap_or_else(|_| panic!("Failed to open file {} for language {}",
-                    variant.path, variant.name)),
+                                                       variant.path, variant.name)),
         );
 
         variant.properties = match jprop::parse_utf8_to_map(&mut prop_file_reader) {
@@ -201,15 +262,72 @@ pub fn i18n(input: TokenStream) -> TokenStream {
             Err(e) => panic!("Failed to parse .properties file: {}, {}", variant.path, e),
         }
     }
+}
 
-    validate_fallbacks_exist(&mut variants);
-    validate_all_keys_in_default_language(&default_variant, &mut variants);
-    resolve_fallbacks_properties(&default_variant, &mut variants);
-    parse_property_values_for_substitution_format(&mut variants);
-    let complexity = find_max_format_index_per_key(&variants);
-    let all_complexity = find_all_format_indices(&variants);
+///Generates the output of the proc macro.
+fn generate_output(language_name: &String, default_variant: &String, variants: &LinkedHashMap<String, Variant>) -> String {
+    let max_format_args = find_max_format_index_per_key(variants);
+    let all_complexity = find_all_format_indices(variants);
 
     let mut output = String::with_capacity(0x4_00_00);
+
+    generate_boiler_plate(language_name, variants, &mut output);
+
+    for k in all_complexity {
+        if k == 0 {
+            continue;
+        }
+
+
+        mk_arg_impl(&mut output, k, "");
+        mk_arg_impl(&mut output, k, "&");
+    }
+
+    let keys_sorted: BTreeSet<String> = variants
+        .get(default_variant)
+        .expect("unreachable: variants.get(default_variant) is none")
+        .properties
+        .keys()
+        .cloned()
+        .collect();
+
+    for k in &keys_sorted {
+        let comp = *max_format_args.get(k).expect("unreachable: keys_sorted not in max_format_args");
+        output.push_str(format!("pub static {k}: I18NValue<{comp}> = I18NValue(&[").as_str());
+        for (_, value) in variants {
+            let prop_val = escape_string_for_source(value.properties.get(k).expect("unreachable: keys_sorted not in Variant.properties"));
+
+            output.push('(');
+            output.push('"');
+            output.push_str(prop_val.as_str());
+            output.push_str("\",");
+
+            let format_parts = value.properties_split_by_format_args.get(k).expect("unreachable: keys_sorted not in Variant.properties_split_by_format_args");
+            output.push_str("&[");
+            for (prefix, index) in format_parts {
+                let prefix = escape_string_for_source(prefix);
+                output.push_str("(\"");
+                output.push_str(prefix.as_str());
+                if *index == usize::MAX {
+                    output.push_str("\", usize::MAX), ");
+                } else {
+                    output.push_str("\", ");
+                    output.push_str(index.to_string().as_str());
+                    output.push_str("), ");
+                }
+            }
+            output.push(']');
+
+
+            output.push_str("),");
+        }
+        output.push_str("]);\n");
+    }
+    output
+}
+
+/// Generate the boilerplate types that are always needed.
+fn generate_boiler_plate(language_name: &String, variants: &LinkedHashMap<String, Variant>, output: &mut String) {
     output.push_str("static SELECTION: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);\n");
 
     output.push_str("pub trait I18NFormatParameter<const MAX_INDEX: usize> {\n");
@@ -231,52 +349,13 @@ pub fn i18n(input: TokenStream) -> TokenStream {
     output.push_str("}\n");
     output.push_str("}\n");
 
-    for k in all_complexity {
-        if k == 0 {
-            continue;
-        }
-        fn mk_arg_impl(output: &mut String, k: usize, prefix: &str) {
-            output.push_str("impl<");
-
-            for n in 0..k {
-                output.push_str(&format!("D{n}: core::fmt::Display, "));
-            }
-
-            output.push_str("> I18NFormatParameter<");
-            output.push_str(k.to_string().as_str());
-            output.push_str("> for ");
-            output.push_str(prefix);
-            output.push('(');
-
-            for n in 0..k {
-                output.push_str(&format!("D{n}, "));
-            }
-            output.push_str(") {\n");
-            output.push_str("fn format_parameter(&self, idx: usize, f: &mut core::fmt::Formatter<'_>) -> std::fmt::Result {\n");
-            output.push_str("match(idx) {\n");
-            for n in 0..k {
-                output.push_str(n.to_string().as_str());
-                output.push_str(" => core::fmt::Display::fmt(&self.");
-                output.push_str(n.to_string().as_str());
-                output.push_str(", f),");
-            }
-            output.push_str("_=> Ok(())\n");
-            output.push_str("}\n");
-            output.push_str("}\n");
-            output.push_str("}\n");
-        }
-
-        mk_arg_impl(&mut output, k, "");
-        mk_arg_impl(&mut output, k, "&");
-    }
-
     output.push_str("#[derive(Debug, Copy, Clone)]\n");
     output.push_str(
         format!(
             "pub struct I18NValue<const MAX_INDEX: usize>(&'static [(&'static str, &'static [(&'static str, usize)]); {}]);\n",
             variants.len()
         )
-        .as_str(),
+            .as_str(),
     );
     output.push_str("impl<const MAX_INDEX: usize> I18NValue<MAX_INDEX> {\n");
     output.push_str("pub fn as_str(&self) -> &'static str {\n");
@@ -353,54 +432,6 @@ pub fn i18n(input: TokenStream) -> TokenStream {
     output.push_str("_ => 0,\n");
     output.push_str("} as u32, core::sync::atomic::Ordering::Relaxed);\n");
     output.push_str("}\n");
-
-    let keys_sorted: BTreeSet<String> = variants
-        .get(&default_variant)
-        .unwrap()
-        .properties
-        .keys()
-        .cloned()
-        .collect();
-
-    for k in &keys_sorted {
-        let comp = *complexity.get(k).unwrap();
-        output.push_str(format!("pub static {k}: I18NValue<{comp}> = I18NValue(&[").as_str());
-        for (_, value) in &variants {
-            let prop_val = escape_string_for_source(value.properties.get(k).unwrap());
-
-            output.push('(');
-            output.push('"');
-            output.push_str(prop_val.as_str());
-            output.push_str("\",");
-            if let Some(complex) = value.properties_split_by_format_args.get(k) {
-                output.push_str("&[");
-                for (prefix, index) in complex {
-                    let prefix = escape_string_for_source(prefix);
-                    output.push_str("(\"");
-                    output.push_str(prefix.as_str());
-                    if *index == usize::MAX {
-                        output.push_str("\", usize::MAX), ");
-                    } else {
-                        output.push_str("\", ");
-                        output.push_str(index.to_string().as_str());
-                        output.push_str("), ");
-                    }
-                }
-                output.push(']');
-            } else {
-                output.push_str("&[]");
-            }
-
-            output.push_str("),");
-        }
-        output.push_str("]);\n");
-    }
-
-    eprintln!("{}", &output);
-    match output.parse::<TokenStream>() {
-        Ok(e) => e,
-        Err(r) => panic!("Generated rust source code is invalid\n {output}\n error={r}"),
-    }
 }
 
 /// Escapes some characters that cant be in a rust string without escaping.
