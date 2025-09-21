@@ -555,11 +555,11 @@ fn parse_property_values_for_substitution_format(variants: &mut LinkedHashMap<St
                         continue;
                     }
 
-                    if n == '}'
-                        && let Ok(idx) = nbuf.parse::<usize>()
-                    {
-                        res.push((mem::take(&mut kbuf), idx));
-                        break;
+                    if n == '}' {
+                        if let Ok(idx) = nbuf.parse::<usize>() {
+                            res.push((mem::take(&mut kbuf), idx));
+                            break;
+                        }
                     }
 
                     kbuf.push('{');

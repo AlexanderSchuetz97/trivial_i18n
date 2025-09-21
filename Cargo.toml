@@ -1,7 +1,15 @@
 [package]
 name = "trivial_i18n"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
+license = "MIT"
+authors = ["Alexander Schütz <aschuetz@protonmail.com>"]
+keywords = ["i18n", "properties", "resource-bundle", "no-std"]
+categories = ["internationalization", "no-std"]
+description = "Trivially simple no-std proc-marco i18n processor, with 0 runtime dependencies."
+readme = "README.md"
+repository = "https://github.com/AlexanderSchuetz97/trivial_i18n"
+rust-version = "1.65.0"
 
 [dependencies]
 jprop = "0.2.0"
