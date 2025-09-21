@@ -1,28 +1,49 @@
-use crate::x::I18NFormatParameter;
+//! # `trivial_i18n`
+//! Trivially simple no-std proc-marco i18n processor, with 0 runtime dependencies.
+#![deny(
+    clippy::correctness,
+    clippy::perf,
+    clippy::complexity,
+    clippy::style,
+    clippy::nursery,
+    clippy::pedantic,
+    clippy::clone_on_ref_ptr,
+    clippy::decimal_literal_representation,
+    clippy::float_cmp_const,
+    clippy::missing_docs_in_private_items,
+    clippy::multiple_inherent_impl,
+    clippy::unwrap_used,
+    clippy::cargo_common_metadata,
+    clippy::used_underscore_binding
+)]
 use linked_hash_map::LinkedHashMap;
 use proc_macro::token_stream::IntoIter;
 use proc_macro::{TokenStream, TokenTree};
-use std::collections::{BTreeSet, HashMap, HashSet};
-use std::fmt::{Display, Write};
+use std::collections::{BTreeSet, HashMap};
 use std::fs::File;
 use std::io::BufReader;
 use std::mem;
-use std::ops::{Deref, Index};
 use std::path::Path;
 
 #[derive(Debug, Clone)]
 struct Variant {
+    /// Language name
     name: String,
+    /// Path to prop file
     path: String,
+    /// Fallback languages
     fallbacks: Vec<String>,
+    /// Raw properties key, value
     properties: HashMap<String, String>,
-    complex_properties: HashMap<String, Vec<(String, usize)>>
+    /// Key->Vec<constant string prefix, index of format argument>
+    /// If index is `usize::MAX` then that means it's a suffix.
+    properties_split_by_format_args: HashMap<String, Vec<(String, usize)>>,
 }
 
 fn parse_path(input: &mut IntoIter) -> String {
     let mut language_name = String::new();
 
-    while let Some(next) = input.next() {
+    for next in input.by_ref() {
         match next {
             TokenTree::Group(_) => {
                 panic!(
@@ -46,8 +67,7 @@ fn parse_path(input: &mut IntoIter) -> String {
 
 #[proc_macro]
 pub fn i18n(input: TokenStream) -> TokenStream {
-
-    let mut token_iter : IntoIter = input.into_iter();
+    let mut token_iter: IntoIter = input.into_iter();
 
     let mut language_name = parse_path(&mut token_iter);
 
@@ -55,9 +75,7 @@ pub fn i18n(input: TokenStream) -> TokenStream {
         language_name = parse_path(&mut token_iter);
     }
 
-    if language_name.is_empty() {
-        panic!("Trying to parse language name but no language name supplied.");
-    }
+    assert!(!language_name.is_empty(), "Trying to parse language name but no language name supplied.");
 
     let Some(TokenTree::Ident(lit)) = token_iter.next() else {
         panic!("Trying to parse language default enum name, a ident, but got non ident.");
@@ -69,16 +87,12 @@ pub fn i18n(input: TokenStream) -> TokenStream {
         panic!("Trying to parse = after default language enum name, but got non Punct TokenTree");
     };
 
-    if p.as_char() != '=' {
-        panic!(
+    assert!((p.as_char() == '='), 
             "Trying to parse = after default language enum name, but got {}",
             p.as_char()
         );
-    }
 
-    if default_variant.is_empty() {
-        panic!("Trying to parse language default variant but got empty token tree.");
-    }
+    assert!(!default_variant.is_empty(), "Trying to parse language default variant but got empty token tree.");
 
     let Some(TokenTree::Literal(lit)) = token_iter.next() else {
         panic!("Trying to parse language default file path, a literal, but got non literal.");
@@ -88,12 +102,10 @@ pub fn i18n(input: TokenStream) -> TokenStream {
         panic!("Trying to parse ; after language default file path, but got non Punct TokenTree");
     };
 
-    if p.as_char() != ';' {
-        panic!(
+    assert!((p.as_char() == ';'), 
             "Trying to parse ; after language default file path, but got {}",
             p.as_char()
         );
-    }
 
     let default_path = lit.to_string();
 
@@ -106,7 +118,7 @@ pub fn i18n(input: TokenStream) -> TokenStream {
             path: default_path,
             fallbacks: vec![],
             properties: Default::default(),
-            complex_properties: Default::default(),
+            properties_split_by_format_args: Default::default(),
         },
     );
 
@@ -123,12 +135,10 @@ pub fn i18n(input: TokenStream) -> TokenStream {
             );
         };
 
-        if p.as_char() != '=' {
-            panic!(
+        assert!((p.as_char() == '='), 
                 "Trying to parse = after language enum name {language_name}, but got {}",
                 p.as_char()
             );
-        }
 
         let Some(TokenTree::Literal(lit)) = token_iter.next() else {
             panic!(
@@ -150,12 +160,10 @@ pub fn i18n(input: TokenStream) -> TokenStream {
                 break;
             }
 
-            if p.as_char() != ',' {
-                panic!(
+            assert!((p.as_char() == ','), 
                     "Trying to parse ; or , after language {variant_name} file path {variant_path}, but got {}",
                     p.as_char()
                 );
-            }
 
             match token_iter.next() {
                 Some(TokenTree::Ident(lit)) => {
@@ -176,21 +184,16 @@ pub fn i18n(input: TokenStream) -> TokenStream {
                 path: variant_path,
                 fallbacks,
                 properties: Default::default(),
-                complex_properties: Default::default(),
+                properties_split_by_format_args: Default::default(),
             },
         );
     }
 
-    for (_, variant) in variants.iter_mut() {
+    for (_, variant) in &mut variants {
         let path = Path::new(&variant.path[1..variant.path.len() - 1]);
         let mut prop_file_reader = BufReader::new(
-            File::open(path).expect(
-                format!(
-                    "Failed to open file {} for language {}",
-                    variant.path, variant.name
-                )
-                .as_str(),
-            ),
+            File::open(path).unwrap_or_else(|_| panic!("Failed to open file {} for language {}",
+                    variant.path, variant.name)),
         );
 
         variant.properties = match jprop::parse_utf8_to_map(&mut prop_file_reader) {
@@ -202,9 +205,9 @@ pub fn i18n(input: TokenStream) -> TokenStream {
     validate_fallbacks_exist(&mut variants);
     validate_all_keys_in_default_language(&default_variant, &mut variants);
     resolve_fallbacks_properties(&default_variant, &mut variants);
-    sort_properties(&mut variants);
-    let complexity = find_max_complexity(&variants);
-    let all_complexity = find_all_complexity(&variants);
+    parse_property_values_for_substitution_format(&mut variants);
+    let complexity = find_max_format_index_per_key(&variants);
+    let all_complexity = find_all_format_indices(&variants);
 
     let mut output = String::with_capacity(0x4_00_00);
     output.push_str("static SELECTION: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);\n");
@@ -236,17 +239,17 @@ pub fn i18n(input: TokenStream) -> TokenStream {
             output.push_str("impl<");
 
             for n in 0..k {
-                output.push_str(&format!("D{}: core::fmt::Display, ", n));
+                output.push_str(&format!("D{n}: core::fmt::Display, "));
             }
 
             output.push_str("> I18NFormatParameter<");
             output.push_str(k.to_string().as_str());
             output.push_str("> for ");
             output.push_str(prefix);
-            output.push_str("(");
+            output.push('(');
 
             for n in 0..k {
-                output.push_str(&format!("D{}, ", n));
+                output.push_str(&format!("D{n}, "));
             }
             output.push_str(") {\n");
             output.push_str("fn format_parameter(&self, idx: usize, f: &mut core::fmt::Formatter<'_>) -> std::fmt::Result {\n");
@@ -295,8 +298,12 @@ pub fn i18n(input: TokenStream) -> TokenStream {
     output.push_str("}\n");
 
     output.push_str("pub fn format(&self, arg: impl I18NFormatParameter<MAX_INDEX>) -> String {\n");
-    output.push_str("struct FMT<'a, const M: usize, T: I18NFormatParameter<M>>(&'a I18NValue<M>, T);\n");
-    output.push_str("impl<const M: usize, T: I18NFormatParameter<M>> core::fmt::Display for FMT<'_, M, T> {\n");
+    output.push_str(
+        "struct FMT<'a, const M: usize, T: I18NFormatParameter<M>>(&'a I18NValue<M>, T);\n",
+    );
+    output.push_str(
+        "impl<const M: usize, T: I18NFormatParameter<M>> core::fmt::Display for FMT<'_, M, T> {\n",
+    );
     output.push_str("fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> std::fmt::Result {\n");
     output.push_str("for (prefix, arg_index) in self.0.0[SELECTION.load(core::sync::atomic::Ordering::Relaxed) as usize].1 {\n");
     output.push_str("let idx = *arg_index;\n");
@@ -311,7 +318,6 @@ pub fn i18n(input: TokenStream) -> TokenStream {
     output.push_str("let formatter = FMT(self, arg);\n");
     output.push_str("ToString::to_string(&formatter)\n");
     output.push_str("}\n");
-
 
     output.push_str("}\n");
 
@@ -348,22 +354,25 @@ pub fn i18n(input: TokenStream) -> TokenStream {
     output.push_str("} as u32, core::sync::atomic::Ordering::Relaxed);\n");
     output.push_str("}\n");
 
-    let keys_sorted: BTreeSet<String> = variants.get(&default_variant).unwrap().properties.keys().cloned().collect();
+    let keys_sorted: BTreeSet<String> = variants
+        .get(&default_variant)
+        .unwrap()
+        .properties
+        .keys()
+        .cloned()
+        .collect();
 
     for k in &keys_sorted {
-        let comp = complexity.get(k).unwrap().clone();
+        let comp = *complexity.get(k).unwrap();
         output.push_str(format!("pub static {k}: I18NValue<{comp}> = I18NValue(&[").as_str());
-        for (_, value) in variants.iter() {
-            let prop_val = escape_string_for_source(value
-                .properties
-                .get(k)
-                .unwrap());
+        for (_, value) in &variants {
+            let prop_val = escape_string_for_source(value.properties.get(k).unwrap());
 
-            output.push_str("(");
-            output.push_str("\"");
+            output.push('(');
+            output.push('"');
             output.push_str(prop_val.as_str());
             output.push_str("\",");
-            if let Some(complex) = value.complex_properties.get(k) {
+            if let Some(complex) = value.properties_split_by_format_args.get(k) {
                 output.push_str("&[");
                 for (prefix, index) in complex {
                     let prefix = escape_string_for_source(prefix);
@@ -377,7 +386,7 @@ pub fn i18n(input: TokenStream) -> TokenStream {
                         output.push_str("), ");
                     }
                 }
-                output.push_str("]");
+                output.push(']');
             } else {
                 output.push_str("&[]");
             }
@@ -388,63 +397,83 @@ pub fn i18n(input: TokenStream) -> TokenStream {
     }
 
     eprintln!("{}", &output);
-    output.parse().unwrap()
+    match output.parse::<TokenStream>() {
+        Ok(e) => e,
+        Err(r) => panic!("Generated rust source code is invalid\n {output}\n error={r}"),
+    }
 }
 
+/// Escapes some characters that cant be in a rust string without escaping.
+/// This function is probably incomplete.
 fn escape_string_for_source(input: &str) -> String {
-    input.replace("\n", "\\n")
-        .replace("\r", "\\r")
-        .replace("\t", "\\t")
-        .replace("\"", "\\\"")
-        .replace("\\", "\\\\")
+    input
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+        .replace('\t', "\\t")
+        .replace('\"', "\\\"")
+        .replace('\\', "\\\\")
 }
 
-fn validate_fallbacks_exist(variants: &mut LinkedHashMap<String, Variant>) {
+/// Checks that all fallback languages exist, panics otherwise.
+fn validate_fallbacks_exist(variants: &LinkedHashMap<String, Variant>) {
     for variant in variants.values() {
         for fallback in &variant.fallbacks {
-            if !variants.contains_key(fallback) {
-                panic!(
-                    "Language '{}' has fallback '{}' which does not exist.",
-                    variant.name, fallback
-                );
-            }
+            assert!(
+                variants.contains_key(fallback),
+                "Language '{}' has fallback '{}' which does not exist.",
+                variant.name,
+                fallback
+            );
         }
     }
 }
 
+/// checks that all keys are in the default language, panics otherwise.
 fn validate_all_keys_in_default_language(
     default_variant: &str,
-    variants: &mut LinkedHashMap<String, Variant>,
+    variants: &LinkedHashMap<String, Variant>,
 ) {
-    let default_variant_value = variants.get(default_variant).unwrap();
+    let default_variant_value = variants.get(default_variant)
+        .expect("unreachable: validate_all_keys_in_default_language -> variants.get default_variant is none");
 
     for variant in variants.values() {
         for k in variant.properties.keys() {
-            if !default_variant_value.properties.contains_key(k) {
-                panic!(
-                    "Language '{}' has a key called '{}' which does not exist in the default language '{}'. The default language must contain all keys!",
-                    variant.name, k, default_variant
-                );
-            }
+            assert!(
+                default_variant_value.properties.contains_key(k),
+                "Language '{}' has a key called '{}' which does not exist in the default language '{}'. The default language must contain all keys!",
+                variant.name,
+                k,
+                default_variant
+            );
         }
     }
 }
 
+/// Resolves all fallback property values
 fn resolve_fallbacks_properties(
     default_variant: &str,
     variants: &mut LinkedHashMap<String, Variant>,
 ) {
     let mut cl = variants.clone();
-    let default_variant_value = cl.get(default_variant).unwrap().clone();
+
+    let default_variant_value = cl
+        .get(default_variant)
+        .expect("unreachable: resolve_fallbacks_properties -> fallback.get default_variant is None")
+        .clone();
 
     for (_, variant) in variants.iter_mut() {
-        'next_prop: for (k, default_value) in default_variant_value.properties.iter() {
+        'next_prop: for (k, default_value) in &default_variant_value.properties {
             if variant.properties.contains_key(k) {
                 continue;
             }
 
             for fallback in &variant.fallbacks {
-                if let Some(fallback_value) = cl.get(fallback).unwrap().properties.get(k) {
+                if let Some(fallback_value) = cl
+                    .get(fallback)
+                    .expect("unreachable: resolve_fallbacks_properties -> fallback.get is None")
+                    .properties
+                    .get(k)
+                {
                     variant
                         .properties
                         .insert(k.to_string(), fallback_value.to_string());
@@ -462,48 +491,10 @@ fn resolve_fallbacks_properties(
     }
 }
 
-fn sort_properties(variants: &mut LinkedHashMap<String, Variant>) {
-    let mut complex = HashSet::new();
+/// Parses all property values for templating format arguments.
+fn parse_property_values_for_substitution_format(variants: &mut LinkedHashMap<String, Variant>) {
     for (_, variant) in variants.iter_mut() {
-        for (k, v) in variant.properties.iter() {
-            let mut g = v.chars();
-            let mut buf = String::new();
-            while let Some(n) = g.next() {
-                if n != '{' {
-                    continue;
-                }
-
-                let Some(n) = g.next() else {
-                    continue;
-                };
-
-                if !n.is_ascii_digit() {
-                    continue;
-                }
-
-                buf.push(n);
-
-                while let Some(n) = g.next() {
-                    if n.is_ascii_digit() {
-                        buf.push(n);
-                        continue;
-                    }
-
-                    if n == '}' {
-                        if buf.parse::<usize>().is_ok() {
-                            complex.insert(k.to_string());
-                        }
-                    }
-                    buf.clear();
-                    break;
-                }
-            }
-        }
-    }
-
-
-    for (_, variant) in variants.iter_mut() {
-        for (k, v) in variant.properties.iter() {
+        for (k, v) in &variant.properties {
             let mut res = Vec::new();
             let mut iter = v.chars();
             let mut kbuf = String::new();
@@ -527,17 +518,17 @@ fn sort_properties(variants: &mut LinkedHashMap<String, Variant>) {
                 let mut nbuf = String::new();
                 nbuf.push(n);
 
-                while let Some(n) = iter.next() {
+                for n in iter.by_ref() {
                     if n.is_ascii_digit() {
                         nbuf.push(n);
                         continue;
                     }
 
-                    if n == '}' {
-                        if let Ok(idx) = nbuf.parse::<usize>() {
-                            res.push((mem::take(&mut kbuf), idx));
-                            break;
-                        }
+                    if n == '}'
+                        && let Ok(idx) = nbuf.parse::<usize>()
+                    {
+                        res.push((mem::take(&mut kbuf), idx));
+                        break;
                     }
 
                     kbuf.push('{');
@@ -551,22 +542,28 @@ fn sort_properties(variants: &mut LinkedHashMap<String, Variant>) {
                 res.push((mem::take(&mut kbuf), usize::MAX));
             }
 
-            variant.complex_properties.insert(k.to_string(), res);
+            variant
+                .properties_split_by_format_args
+                .insert(k.to_string(), res);
         }
     }
 }
 
-fn find_max_complexity(variants: &LinkedHashMap<String, Variant>) -> HashMap<String, usize> {
+/// Gets the maximum format index for every key.
+/// Maximum refers to across all languages.
+fn find_max_format_index_per_key(
+    variants: &LinkedHashMap<String, Variant>,
+) -> HashMap<String, usize> {
     let mut res = HashMap::new();
-    for (_, variant) in variants.iter() {
-        for (k, v) in variant.properties.iter() {
+    for variant in variants.values() {
+        for k in variant.properties.keys() {
             res.insert(k.to_string(), 0);
         }
     }
 
-    for (_, variant) in variants.iter() {
-        for (k, v) in variant.complex_properties.iter() {
-            let max = res.get_mut(k).unwrap();
+    for (_, variant) in variants {
+        for (k, v) in &variant.properties_split_by_format_args {
+            let max = res.get_mut(k).expect("infallible");
             for (_, param) in v {
                 if *param == usize::MAX {
                     continue;
@@ -582,12 +579,13 @@ fn find_max_complexity(variants: &LinkedHashMap<String, Variant>) -> HashMap<Str
     res
 }
 
-fn find_all_complexity(variants: &LinkedHashMap<String, Variant>) -> BTreeSet<usize> {
+/// Finds all format indices used by all keys in all languages.
+fn find_all_format_indices(variants: &LinkedHashMap<String, Variant>) -> BTreeSet<usize> {
     let mut res = BTreeSet::new();
     res.insert(0);
 
-    for (_, variant) in variants.iter() {
-        for (k, v) in variant.complex_properties.iter() {
+    for (_, variant) in variants {
+        for v in variant.properties_split_by_format_args.values() {
             let mut max = 0;
             for (_, param) in v {
                 if *param == usize::MAX {
@@ -604,100 +602,4 @@ fn find_all_complexity(variants: &LinkedHashMap<String, Variant>) -> BTreeSet<us
     }
 
     res
-}
-
-
-mod global_state {
-    pub enum Language {
-        English,
-        German
-    }
-}
-mod x {
-    static SELECTION: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
-    pub trait I18NFormatParameter<const MAX_INDEX: usize> {
-        fn format_parameter(&self, idx: usize, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result;
-    }
-    impl I18NFormatParameter<0> for () {
-        fn format_parameter(&self, idx: usize, f: &mut core::fmt::Formatter<'_>) -> std::fmt::Result {
-            Ok(())
-        }
-    }
-    impl<const MAX_INDEX: usize, T: core::fmt::Display> I18NFormatParameter<MAX_INDEX> for &[T] {
-        fn format_parameter(&self, idx: usize, f: &mut core::fmt::Formatter<'_>) -> std::fmt::Result {
-            let Some(dsp) = self.get(idx) else {
-                return Ok(());
-            };
-            core::fmt::Display::fmt(dsp, f)
-        }
-    }
-    #[derive(Debug, Copy, Clone)]
-    pub struct I18NValue<const MAX_INDEX: usize>(&'static [(&'static str, &'static [(&'static str, usize)]); 2]);
-    impl<const MAX_INDEX: usize> I18NValue<MAX_INDEX> {
-        pub fn as_str(&self) -> &'static str {
-            self.0[SELECTION.load(core::sync::atomic::Ordering::Relaxed) as usize].0
-        }
-        pub const fn default_str(&self) -> &'static str {
-            self.0[0].0
-        }
-        pub fn format_with<T: >(&self, arg: impl I18NFormatParameter<MAX_INDEX>, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-            for (prefix, arg_index) in self.0[SELECTION.load(core::sync::atomic::Ordering::Relaxed) as usize].1 {
-                let idx = *arg_index;
-                f.write_str(prefix)?;
-                if idx != usize::MAX {
-                    arg.format_parameter(idx, f)?;
-                }
-            }
-            Ok(())
-        }
-        pub fn format(&self, arg: impl I18NFormatParameter<MAX_INDEX>) -> String {
-            struct FMT<'a, const M: usize, T: I18NFormatParameter<M>>(&'a I18NValue<M>, T);
-            impl<const M: usize, T: I18NFormatParameter<M>> core::fmt::Display for FMT<'_, M, T> {
-                fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> std::fmt::Result {
-                    for (prefix, arg_index) in self.0.0[SELECTION.load(core::sync::atomic::Ordering::Relaxed) as usize].1 {
-                        let idx = *arg_index;
-                        f.write_str(prefix)?;
-                        if idx != usize::MAX {
-                            self.1.format_parameter(idx, f)?;
-                        }
-                    }
-                    Ok(())
-                }
-            }
-            let formatter = FMT(self, arg);
-            ToString::to_string(&formatter)
-        }
-    }
-    impl<const MAX_INDEX: usize> AsRef<str> for I18NValue<MAX_INDEX> {
-        fn as_ref(&self) -> &str {
-            self.as_str()
-        }
-    }
-    impl<const MAX_INDEX: usize> From<I18NValue<MAX_INDEX>> for String {
-        fn from(value: I18NValue<MAX_INDEX>) -> String {
-            value.as_str().to_string()
-        }
-    }
-    impl<const MAX_INDEX: usize> From<I18NValue<MAX_INDEX>> for &'static str {
-        fn from(value: I18NValue<MAX_INDEX>) -> &'static str {
-            value.as_str()
-        }
-    }
-    impl<const MAX_INDEX: usize> core::fmt::Display for I18NValue<MAX_INDEX> {
-        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-            f.write_str(self.as_str())
-        }
-    }
-    pub fn set_i18n_language(language: crate::global_state::Language) {
-        SELECTION.store(match language {
-            crate::global_state::Language::English => 0,
-            crate::global_state::Language::German => 1,
-            _ => 0,
-        } as u32, core::sync::atomic::Ordering::Relaxed);
-    }
-
-    pub static HELLO_WORLD: I18NValue<0> = I18NValue(&[("Hello World!",&[("Hello World!", usize::MAX), ]),("Hallo Welt!",&[("Hallo Welt!", usize::MAX), ]),]);
-    pub static WELD_SEAM: I18NValue<0> = I18NValue(&[("Weld seam",&[("Weld seam", usize::MAX), ]),("Schweißnaht",&[("Schweißnaht", usize::MAX), ]),]);
-    pub static MOUNTAIN: I18NValue<0> = I18NValue(&[("Mountain",&[("Mountain", usize::MAX), ]),("Mountain",&[("Mountain", usize::MAX), ]),]);
-
 }

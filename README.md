@@ -1,5 +1,5 @@
 # trivial_i18n
-Trivially simple no-std compile time i18n processor, with 0 runtime dependencies.
+Trivially simple no-std proc-marco i18n processor, with 0 runtime dependencies.
 
 The generated code supports language switching at runtime.
 ## Usage
