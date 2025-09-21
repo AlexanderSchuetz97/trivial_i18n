@@ -155,19 +155,47 @@ fn test() {
     
     //If you are uninterested in using the format function, you can also access the key normally like any other regular key.
     assert_eq!("Hello {0}! Today is {1}! Have a nice day!", i18n::GREETING.as_str());
-
 }
 ```
 
-there is also a fn called `format_with` which accepts the string tuple as well as a `&mut core::fmt::Formatter`
-its intended to be used within Display implementations.
+In addition to the `format(arg_tuple)` fn there are also the following functions:
+* `format_with(arg_tuple, &mut core::fmt::Formatter) -> core::fmt::Result` - which is intended to be used within Display/Debug implementations.
+* `format_into<T: core::fmt::Write>(arg_tuple, &mut T) -> core::fmt::Result` - which is intended to be used to append to a String or similar target buffers.
 
-In general, the format function accepts a slice of any length or a tuple of a matching length.
+Example for `format_with`:
+```rust
+//Naturally this only makes sense for a more complex struct.
+struct Dummy;
+
+impl core::fmt::Display for Dummy {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        i18n::GREETING.format_with(("John", "Tuesday"), f)
+    }
+}
+
+fn test() {
+    let formatted = format!("Greeting: {}", Dummy);
+    assert_eq!("Hello John! Today is Tuesday! Have a nice day!", &formatted);
+}
+```
+
+Example for `format_into`:
+```rust
+fn test() {
+    let mut buffer = String::new();
+    buffer.push_str("Greeting: ");
+    
+    _= i18n::TWO_PARAM_REVERSE.format_into(("John", "Tuesday"), &mut buffer);
+    assert_eq!("Greeting: Hello John! Today is Tuesday! Have a nice day!", &buffer);
+}
+```
+
+In general, the format functions accepts a slice of any length, a tuple of a matching length, or an array of a matching length.
 The implementation does NOT panic if the slice is too small. It will simply substitute the indices which would be too large with empty string.
-If the number of elements is known, then using tuples instead of slices is preferable because the compiler emits a compiler error if the number 
+If the number of elements is known, then using tuples or arrays instead of slices is preferable because the compiler emits a compiler error if the number 
 of elements in the tuple does NOT match the number of expected parameters.
 
-The elements in the Tuple/Slice can be any element that implements Display.
+The elements in the Tuple/Array/Slice can be any element that implements Display.
 
 ### Single parameter templating
 Unfortunately, the format function does not accept a non-tuple single Display argument due to rust trait constraints.
@@ -182,6 +210,108 @@ GREETING=Hello {0}! Have a nice day!
 fn test() {
     //The comma after "John" is important, it won't compile without it.
     let formatted : String = i18n::GREETING.format(("John", ));
+    //Or pass it as a 1 element array...
+    let formatted : String = i18n::GREETING.format(["John"]);
+    assert_eq!("Hello John! Have a nice day!");
+}
+```
+
+## Implementing custom traits for i18n values
+```rust
+pub trait MyTrait {
+    fn dummy_fn(&self);
+}
+
+mod i18n {
+    enum SupportedLanguages {
+        English,
+        German
+    }
+    
+    trivial_i18n::i18n! {
+        SupportedLanguages;
+        English="i18n/ENGLISH.properties";
+        German="i18n/GERMAN.properties";
+    }
+    
+    // The macro will always generate a struct named I18NValue<usize> 
+    // You can implement traits of your UI framework here like this, 
+    // to allow for direct use of I18NValue in your framework.
+    impl<const FORMAT_ARG_COUNT: usize> MyTrait for I18NValue<FORMAT_ARG_COUNT> {
+        fn dummy_fn(&self) {
+            _= self.as_str();
+            _= self.format(["Whatever...", "Parameters..."]);
+            //...
+            todo!()
+        }
+    }
+}
+```
+
+## Custom structs as format arguments.
+```
+GREETING=Hello {0}! Today is {1}! Have a nice day!
+```
+
+```rust
+pub struct MyStruct {
+    //...
+}
+
+pub struct MyStruct2 {
+    //...
+}
+
+mod i18n {
+    enum SupportedLanguages {
+        English,
+        German
+    }
+    
+    trivial_i18n::i18n! {
+        SupportedLanguages;
+        English="i18n/ENGLISH.properties";
+        German="i18n/GERMAN.properties";
+    }
+    
+    // The macro will always generate a trait named I18NFormatParameter<usize> 
+    // All types that implement this trait can be used in format/format_with/format_into as first parameter.
+    //
+    // If index is greater than what the struct can "handle" then the impl should do nothing as shown here.
+    //
+    // It is up to you if you implement this trait for a ref or the struct directly, 
+    // most of the time the ref make more sense.
+    impl<const FORMAT_ARG_COUNT: usize> I18NFormatParameter<FORMAT_ARG_COUNT> for &MyStruct {
+        fn format_parameter(&self, index: usize, f: &mut Formatter<'_>) -> std::fmt::Result {
+            assert!(index < FORMAT_ARG_COUNT); //This is guaranteed.
+            
+            match index {
+                0 => f.write_str("John"),
+                1 => f.write_str("Tuesday"),
+                _ => Ok(()),
+            }
+        }
+    }
+
+
+    // If you know that your struct will only ever handle 2 parameters for example then you can also
+    // remove the generic like this:
+    // This will make any call to format/format_with/format_into with MyStruct2 
+    // to a I18N value that does not accept exactly 2 parameters a compiler error.
+    impl I18NFormatParameter<2> for &MyStruct2 {
+        fn format_parameter(&self, index: usize, f: &mut Formatter<'_>) -> std::fmt::Result {
+            match index {
+                0 => f.write_str("John"),
+                1 => f.write_str("Tuesday"),
+                _ => unreachable!(), //This is guaranteed.
+            }
+        }
+    }
+}
+
+fn test() {
+    let formatted : String = i18n::GREETING.format(&MyStruct);
+    let formatted : String = i18n::GREETING.format(&MyStruct2);
     assert_eq!("Hello John! Have a nice day!");
 }
 ```

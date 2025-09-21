@@ -68,7 +68,7 @@ fn parse_path(input: &mut IntoIter) -> String {
 }
 
 /// Makes an impl for a tuple with k elements into a format arg.
-fn mk_arg_impl(output: &mut String, k: usize, prefix: &str) {
+fn output_tuple_arg_impl(output: &mut String, k: usize, prefix: &str) {
     output.push_str("impl<");
 
     for n in 0..k {
@@ -85,13 +85,36 @@ fn mk_arg_impl(output: &mut String, k: usize, prefix: &str) {
         let _ = write!(output, "D{n}, ");
     }
     output.push_str(") {\n");
-    output.push_str("fn format_parameter(&self, idx: usize, f: &mut core::fmt::Formatter<'_>) -> std::fmt::Result {\n");
+    output.push_str("fn format_parameter(&self, idx: usize, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {\n");
     output.push_str("match(idx) {\n");
     for n in 0..k {
         output.push_str(n.to_string().as_str());
         output.push_str(" => core::fmt::Display::fmt(&self.");
         output.push_str(n.to_string().as_str());
         output.push_str(", f),");
+    }
+    output.push_str("_=> Ok(())\n");
+    output.push_str("}\n");
+    output.push_str("}\n");
+    output.push_str("}\n");
+}
+
+/// Makes an impl for an array with k elements into a format arg.
+fn output_array_arg_impl(output: &mut String, k: usize, prefix: &str) {
+    output.push_str("impl<T: core::fmt::Display> I18NFormatParameter<");
+    output.push_str(k.to_string().as_str());
+    output.push_str("> for ");
+    output.push_str(prefix);
+    output.push_str("[T; ");
+    output.push_str(k.to_string().as_str());
+    output.push_str("] {\n");
+    output.push_str("fn format_parameter(&self, idx: usize, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {\n");
+    output.push_str("match(idx) {\n");
+    for n in 0..k {
+        output.push_str(n.to_string().as_str());
+        output.push_str(" => core::fmt::Display::fmt(&self[");
+        output.push_str(n.to_string().as_str());
+        output.push_str("], f),");
     }
     output.push_str("_=> Ok(())\n");
     output.push_str("}\n");
@@ -279,8 +302,10 @@ fn generate_output(language_name: &String, default_variant: &String, variants: &
         }
 
 
-        mk_arg_impl(&mut output, k, "");
-        mk_arg_impl(&mut output, k, "&");
+        output_tuple_arg_impl(&mut output, k, "");
+        output_tuple_arg_impl(&mut output, k, "&");
+        output_array_arg_impl(&mut output, k, "");
+        output_array_arg_impl(&mut output, k, "&");
     }
 
     let keys_sorted: BTreeSet<String> = variants
@@ -335,13 +360,13 @@ fn generate_boiler_plate(language_name: &String, variants: &LinkedHashMap<String
     output.push_str("}\n");
 
     output.push_str("impl I18NFormatParameter<0> for () {\n");
-    output.push_str("fn format_parameter(&self, idx: usize, f: &mut core::fmt::Formatter<'_>) -> std::fmt::Result {\n");
+    output.push_str("fn format_parameter(&self, idx: usize, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {\n");
     output.push_str("Ok(())\n");
     output.push_str("}\n");
     output.push_str("}\n");
 
     output.push_str("impl<const MAX_INDEX: usize, T: core::fmt::Display> I18NFormatParameter<MAX_INDEX> for &[T] {\n");
-    output.push_str("fn format_parameter(&self, idx: usize, f: &mut core::fmt::Formatter<'_>) -> std::fmt::Result {\n");
+    output.push_str("fn format_parameter(&self, idx: usize, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {\n");
     output.push_str("let Some(dsp) = self.get(idx) else {\n");
     output.push_str("return Ok(());\n");
     output.push_str("};\n");
@@ -365,7 +390,7 @@ fn generate_boiler_plate(language_name: &String, variants: &LinkedHashMap<String
     output.push_str("self.0[0].0\n");
     output.push_str("}\n");
 
-    output.push_str("pub fn format_with<T: >(&self, arg: impl I18NFormatParameter<MAX_INDEX>, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {\n");
+    output.push_str("pub fn format_with(&self, arg: impl I18NFormatParameter<MAX_INDEX>, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {\n");
     output.push_str("for (prefix, arg_index) in self.0[SELECTION.load(core::sync::atomic::Ordering::Relaxed) as usize].1 {\n");
     output.push_str("let idx = *arg_index;\n");
     output.push_str("f.write_str(prefix)?;\n");
@@ -376,6 +401,28 @@ fn generate_boiler_plate(language_name: &String, variants: &LinkedHashMap<String
     output.push_str("Ok(())\n");
     output.push_str("}\n");
 
+    output.push_str("pub fn format_into<T: core::fmt::Write>(&self, arg: impl I18NFormatParameter<MAX_INDEX>, f: &mut T) -> core::fmt::Result {\n");
+    output.push_str(
+        "struct FMT<'a, const M: usize, T: I18NFormatParameter<M>>(&'a I18NValue<M>, T);\n",
+    );
+    output.push_str(
+        "impl<const M: usize, T: I18NFormatParameter<M>> core::fmt::Display for FMT<'_, M, T> {\n",
+    );
+    output.push_str("fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {\n");
+    output.push_str("for (prefix, arg_index) in self.0.0[SELECTION.load(core::sync::atomic::Ordering::Relaxed) as usize].1 {\n");
+    output.push_str("let idx = *arg_index;\n");
+    output.push_str("f.write_str(prefix)?;\n");
+    output.push_str("if idx != usize::MAX {\n");
+    output.push_str("self.1.format_parameter(idx, f)?;\n");
+    output.push_str("}\n");
+    output.push_str("}\n");
+    output.push_str("Ok(())\n");
+    output.push_str("}\n");
+    output.push_str("}\n");
+    output.push_str("let formatter = FMT(self, arg);\n");
+    output.push_str("core::write!(f, \"{}\", formatter)\n");
+    output.push_str("}\n");
+
     output.push_str("pub fn format(&self, arg: impl I18NFormatParameter<MAX_INDEX>) -> String {\n");
     output.push_str(
         "struct FMT<'a, const M: usize, T: I18NFormatParameter<M>>(&'a I18NValue<M>, T);\n",
@@ -383,7 +430,7 @@ fn generate_boiler_plate(language_name: &String, variants: &LinkedHashMap<String
     output.push_str(
         "impl<const M: usize, T: I18NFormatParameter<M>> core::fmt::Display for FMT<'_, M, T> {\n",
     );
-    output.push_str("fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> std::fmt::Result {\n");
+    output.push_str("fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {\n");
     output.push_str("for (prefix, arg_index) in self.0.0[SELECTION.load(core::sync::atomic::Ordering::Relaxed) as usize].1 {\n");
     output.push_str("let idx = *arg_index;\n");
     output.push_str("f.write_str(prefix)?;\n");
@@ -437,12 +484,24 @@ fn generate_boiler_plate(language_name: &String, variants: &LinkedHashMap<String
 /// Escapes some characters that cant be in a rust string without escaping.
 /// This function is probably incomplete.
 fn escape_string_for_source(input: &str) -> String {
-    input
-        .replace('\n', "\\n")
-        .replace('\r', "\\r")
-        .replace('\t', "\\t")
-        .replace('\"', "\\\"")
-        .replace('\\', "\\\\")
+    let mut target = String::new();
+    for c in input.chars() {
+        match c {
+            '\\' => target.push_str("\\\\"),
+            '\n' => target.push_str("\\n"),
+            '\r' => target.push_str("\\r"),
+            '\t' => target.push_str("\\t"),
+            '\"' => target.push_str("\\\""),
+            '\0' => target.push_str("\\0"),
+            ' '..='~' => target.push(c),
+            other => {
+                target.push_str("\\u{");
+                _= write!(target, "{:X}", other as u64);
+                target.push('}');
+            },
+        }
+    }
+    target
 }
 
 /// Checks that all fallback languages exist, panics otherwise.
