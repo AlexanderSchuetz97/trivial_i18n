@@ -315,7 +315,34 @@ fn test() {
     assert_eq!("Hello John! Have a nice day!");
 }
 ```
+## How do I use this with my no-std crate?
+You need to import alloc as well as some types that are not present in no-std.
+After doing that, all other things behave exactly as with the standard library.
 
+The proc macro does not generate those imports because they require `extern crate alloc` 
+which is not desirable in crates that use the standard library.
+
+This shows the minimal no-std example that compiles:
+```rust
+#![no_std]
+extern crate alloc;
+
+mod i18n {
+    use alloc::string::String;
+    use alloc::string::ToString;
+    
+    enum SupportedLanguages {
+        English,
+        German
+    }
+    
+    trivial_i18n::i18n! {
+        SupportedLanguages;
+        English="i18n/ENGLISH.properties";
+        German="i18n/GERMAN.properties";
+    }
+}
+```
 ## What does the proc-macro generate?
 This
 ```rust

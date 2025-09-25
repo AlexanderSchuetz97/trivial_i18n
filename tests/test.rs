@@ -1,9 +1,8 @@
-use std::fmt::Formatter;
+#![allow(uncommon_codepoints)]
+
 use crate::i18n::Language;
 
 pub mod i18n {
-    use std::fmt::Formatter;
-
     pub enum Language {
         English,
         UsaEnglish,
@@ -13,15 +12,13 @@ pub mod i18n {
     }
 
     trivial_i18n::i18n! {
-        8;
+        10;
         Language;
         English="tests/english.properties";
         UsaEnglish="tests/us_english.properties";
         German="tests/german.properties";
         SwissGerman="tests/swiss_german.properties",German;
     }
-
-
 }
 
 
@@ -58,6 +55,13 @@ pub fn test() {
     assert_eq!("ABCティーポットABC", i18n::JAPAN_MOON_RUNES.as_str());
     assert_eq!("\"\"''&%/=?)(&%/))(&&§E&)   \0", i18n::ESCAPE_CHARACTERS.as_str());
 
+    assert_eq!("123", i18n::_bad_DOT_key.as_str());
+    assert_eq!("456", i18n::_123.as_str());
+    assert_eq!("678", i18n::_123_0.as_str());
+    assert_eq!("123", i18n::_123_1.as_str());
+    assert_eq!("𝕊", i18n::𝕊.as_str());
+    assert_eq!("😀", i18n::___0.as_str());
+    assert_eq!("_", i18n::__.as_str());
 
     i18n::set_i18n_language(Language::UsaEnglish);
     assert_eq!("Color", i18n::COLOR.as_str());
@@ -163,9 +167,4 @@ pub fn test() {
     assert_eq!("Test1: beep Test4: bap", i18n::TWO_PARAM_SKIP.format(["_ignored", "beep", "_ignored", "_ignored", "bap"].as_slice()));
     assert_eq!("Test1:  Test4: ", i18n::TWO_PARAM_SKIP.format(["beep"].as_slice()));
     assert_eq!("Test1: {1} Test4: {4}", i18n::TWO_PARAM_SKIP.as_str());
-}
-
-fn tes2t() {
-    let mut buffer = String::new();
-    _= i18n::TWO_PARAM_REVERSE.format_into(("beep", "bop"), &mut buffer);
 }

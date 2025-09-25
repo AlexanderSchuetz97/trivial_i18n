@@ -19,26 +19,27 @@
 use linked_hash_map::LinkedHashMap;
 use proc_macro::token_stream::IntoIter;
 use proc_macro::{TokenStream, TokenTree};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::fmt::Write;
 use std::fs::File;
 use std::io::BufReader;
 use std::mem;
 use std::path::Path;
-use std::fmt::Write;
+use unicode_xid::UnicodeXID;
 
 /// Struct that holds data associated with a single language variant.
 #[derive(Debug, Clone)]
 struct Variant {
     /// Language name
     name: String,
-    /// Path to prop file
+    /// Path to a prop file
     path: String,
     /// Fallback languages
     fallbacks: Vec<String>,
     /// Raw properties key, value
     properties: HashMap<String, String>,
     /// Key->Vec<constant string prefix, index of format argument>
-    /// If index is `usize::MAX` then that means it's a suffix.
+    /// If the index is `usize::MAX`, then that means it's a suffix.
     properties_split_by_format_args: HashMap<String, Vec<(String, usize)>>,
 }
 
@@ -158,10 +159,7 @@ pub fn i18n(input: TokenStream) -> TokenStream {
             );
         };
 
-        assert!((p.as_char() == '='), 
-                "Trying to parse = after language enum name {language_name}, but got {}",
-                p.as_char()
-            );
+        assert_eq!(p.as_char(), '=', "Trying to parse = after language enum name {language_name}, but got {}", p.as_char());
 
         let Some(TokenTree::Literal(lit)) = token_iter.next() else {
             panic!(
@@ -217,7 +215,6 @@ pub fn i18n(input: TokenStream) -> TokenStream {
 
     let output = generate_output(&language_name, &default_variant, &variants);
 
-    eprintln!("{}", &output);
     match output.parse::<TokenStream>() {
         Ok(e) => e,
         Err(r) => panic!("Generated rust source code is invalid\n {output}\n error={r}"),
@@ -294,7 +291,9 @@ fn generate_output(language_name: &String, default_variant: &String, variants: &
 
     let mut output = String::with_capacity(0x4_00_00);
 
-    generate_boiler_plate(language_name, variants, &mut output);
+    generate_boiler_plate(&mut output);
+    generate_i18n_value_struct(variants, &mut output);
+    generate_language_setter(language_name, variants, &mut output);
 
     for k in all_complexity {
         if k == 0 {
@@ -316,9 +315,12 @@ fn generate_output(language_name: &String, default_variant: &String, variants: &
         .cloned()
         .collect();
 
+    let var_name_mapping = get_key_to_var_name_mapping(&keys_sorted);
+
     for k in &keys_sorted {
         let comp = *max_format_args.get(k).expect("unreachable: keys_sorted not in max_format_args");
-        output.push_str(format!("pub static {k}: I18NValue<{comp}> = I18NValue(&[").as_str());
+        let mapped = var_name_mapping.get(k).expect("unreachable: var_name_mapping not found");
+        output.push_str(format!("pub static {mapped}: I18NValue<{comp}> = I18NValue(&[").as_str());
         for (_, value) in variants {
             let prop_val = escape_string_for_source(value.properties.get(k).expect("unreachable: keys_sorted not in Variant.properties"));
 
@@ -352,7 +354,7 @@ fn generate_output(language_name: &String, default_variant: &String, variants: &
 }
 
 /// Generate the boilerplate types that are always needed.
-fn generate_boiler_plate(language_name: &String, variants: &LinkedHashMap<String, Variant>, output: &mut String) {
+fn generate_boiler_plate(output: &mut String) {
     output.push_str("static SELECTION: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);\n");
 
     output.push_str("pub trait I18NFormatParameter<const MAX_INDEX: usize> {\n");
@@ -374,14 +376,6 @@ fn generate_boiler_plate(language_name: &String, variants: &LinkedHashMap<String
     output.push_str("}\n");
     output.push_str("}\n");
 
-    output.push_str("#[derive(Debug, Copy, Clone)]\n");
-    output.push_str(
-        format!(
-            "pub struct I18NValue<const MAX_INDEX: usize>(&'static [(&'static str, &'static [(&'static str, usize)]); {}]);\n",
-            variants.len()
-        )
-            .as_str(),
-    );
     output.push_str("impl<const MAX_INDEX: usize> I18NValue<MAX_INDEX> {\n");
     output.push_str("pub fn as_str(&self) -> &'static str {\n");
     output.push_str("self.0[SELECTION.load(core::sync::atomic::Ordering::Relaxed) as usize].0\n");
@@ -470,7 +464,22 @@ fn generate_boiler_plate(language_name: &String, variants: &LinkedHashMap<String
     output.push_str("f.write_str(self.as_str())\n");
     output.push_str("}\n");
     output.push_str("}\n");
+}
 
+/// Generates the `I18NValue` based on the number of variants.
+fn generate_i18n_value_struct(variants: &LinkedHashMap<String, Variant>, output: &mut String) {
+    output.push_str("#[derive(Debug, Copy, Clone)]\n");
+    output.push_str(
+        format!(
+            "pub struct I18NValue<const MAX_INDEX: usize>(&'static [(&'static str, &'static [(&'static str, usize)]); {}]);\n",
+            variants.len()
+        )
+            .as_str(),
+    );
+}
+
+/// Generates the `set_i18n_language` function.
+fn generate_language_setter(language_name: &String, variants: &LinkedHashMap<String, Variant>, output: &mut String) {
     output.push_str(format!("pub fn set_i18n_language(language: {language_name}) {{\n").as_str());
     output.push_str("SELECTION.store(match language {\n");
     for (idx, key) in variants.keys().enumerate() {
@@ -692,4 +701,151 @@ fn find_all_format_indices(variants: &LinkedHashMap<String, Variant>) -> BTreeSe
     }
 
     res
+}
+
+fn escape_char_in_variable_name(c: char) -> Option<&'static str> {
+    //Want a symbol added? I don't mind. Make a pr.
+    Some(match c {
+        ' ' => "_SPACE_",
+        '\n' => "_LINE_FEED_",
+        '\t' => "_TAB_",
+        '\r' => "_CARRIAGE_RETURN_",
+        '\0' => "_ZERO_",
+        '#' => "_HASH_",
+        ':' => "_COLON_",
+        ';' => "_SEMI_COLON_",
+        '.' => "_DOT_",
+        ',' => "_COMMA_",
+        '?' => "_QUESTION_MARK_",
+        '!' => "_EXCLAMATION_MARK_",
+        '+' => "_PLUS_",
+        '-' => "_MINUS_",
+        '*' => "_MULTIPLY_",
+        '<' => "_LESS_THAN_",
+        '>' => "_GREATER_THAN_",
+        '/' => "_SLASH_",
+        '\\' => "_BACKSLASH_",
+        '(' => "_BRACKET_OPEN_",
+        ')' => "_BRACKET_CLOSE_",
+        '=' => "_EQUALS_",
+        '[' => "_SQUARE_BRACKET_OPEN_",
+        ']' => "_SQUARE_BRACKET_CLOSE_",
+        '{' => "_CURLY_BRACKET_OPEN_",
+        '}' => "_CURLY_BRACKET_CLOSE_",
+        '`' => "_GRAVE_ACCENT_",
+        '´' => "_ACUTE_ACCENT_",
+        '"' => "_QUOTE_",
+        '\'' => "_SINGLE_QUOTE_",
+        '°' => "_DEGREE_",
+        '^' => "_CARET_",
+        '|' => "_PIPE_",
+        '~' => "_TILDE_",
+        '&' => "_AND_",
+        '$' => "_DOLLAR_",
+        '€' => "_EURO_",
+        '£' => "_POUND_STERLING_",
+        '¥' => "_YEN_",
+        '@' => "_AT_",
+        '™' => "_TRADEMARK_",
+        '®' => "_REGISTERED_TRADEMARK_",
+        '©' => "_COPYRIGHT_",
+        '%' => "_PERCENT_",
+        _ => return None,
+    })
+}
+
+fn get_key_to_var_name_mapping(keys: &BTreeSet<String>) -> HashMap<String, String> {
+    let mut result = HashMap::new();
+    let mut problem_keys = Vec::new();
+    let mut used_keys = HashSet::new();
+    'next_key: for k in keys {
+        if k == "_" {
+            problem_keys.push(k.clone());
+            continue;
+        }
+
+        let Some(first_char) = k.chars().next() else {
+            problem_keys.push(k.clone());
+            continue;
+        };
+
+        if first_char.is_ascii_digit() {
+            problem_keys.push(k.clone());
+            continue;
+        }
+
+        if first_char != '_' && !first_char.is_xid_start() {
+            problem_keys.push(k.clone());
+            continue;
+        }
+
+        for c in k.chars() {
+            if !c.is_xid_continue() {
+                problem_keys.push(k.clone());
+                continue 'next_key;
+            }
+
+            if c.is_whitespace() {
+                problem_keys.push(k.clone());
+                continue 'next_key;
+            }
+
+            if escape_char_in_variable_name(c).is_some() {
+                problem_keys.push(k.clone());
+                continue 'next_key;
+            }
+        }
+
+        result.insert(k.clone(), k.clone());
+        used_keys.insert(k.clone());
+    }
+
+    'next_key: for k in problem_keys {
+        let mut mapped_key = String::new();
+        mapped_key.push('_');
+
+        for c in k.chars() {
+            if let Some(escape) = escape_char_in_variable_name(c) {
+                mapped_key.push_str(escape);
+                continue;
+            }
+
+            if !c.is_xid_continue() {
+                mapped_key.push('_');
+                continue;
+            }
+
+            if c.is_whitespace() {
+                mapped_key.push('_');
+                continue;
+            }
+
+            if c.is_ascii_control() {
+                mapped_key.push('_');
+                continue;
+            }
+
+            mapped_key.push(c);
+        }
+
+        if !used_keys.contains(&mapped_key) {
+            used_keys.insert(mapped_key.clone());
+            result.insert(k, mapped_key);
+            continue;
+        }
+
+        let mut i = 0u128;
+        loop {
+            let fmt = format!("{mapped_key}_{i}");
+            if !used_keys.contains(&fmt) {
+                used_keys.insert(mapped_key.clone());
+                result.insert(k, fmt);
+                continue 'next_key;
+            }
+
+            i = i.checked_add(1).expect("overflow");
+        }
+    }
+
+    result
 }
