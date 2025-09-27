@@ -73,7 +73,7 @@ fn output_tuple_arg_impl(output: &mut String, k: usize, prefix: &str) {
     output.push_str("impl<");
 
     for n in 0..k {
-        _= write!(output, "D{n}: core::fmt::Display, ");
+        _ = write!(output, "D{n}: core::fmt::Display, ");
     }
 
     output.push_str("> I18NFormatParameter<");
@@ -142,7 +142,10 @@ pub fn i18n(input: TokenStream) -> TokenStream {
         language_name = parse_path(&mut token_iter);
     }
 
-    assert!(!language_name.is_empty(), "Trying to parse language name but no language name supplied.");
+    assert!(
+        !language_name.is_empty(),
+        "Trying to parse language name but no language name supplied."
+    );
 
     let default_variant = parse_default_variant(&mut token_iter, &mut variants);
 
@@ -159,7 +162,12 @@ pub fn i18n(input: TokenStream) -> TokenStream {
             );
         };
 
-        assert_eq!(p.as_char(), '=', "Trying to parse = after language enum name {language_name}, but got {}", p.as_char());
+        assert_eq!(
+            p.as_char(),
+            '=',
+            "Trying to parse = after language enum name {language_name}, but got {}",
+            p.as_char()
+        );
 
         let Some(TokenTree::Literal(lit)) = token_iter.next() else {
             panic!(
@@ -223,7 +231,10 @@ pub fn i18n(input: TokenStream) -> TokenStream {
 
 /// Parses the default variant from the token stream and add it to the variant list.
 /// returns the name of the default variant.
-fn parse_default_variant(token_iter: &mut IntoIter, variants: &mut LinkedHashMap<String, Variant>) -> String {
+fn parse_default_variant(
+    token_iter: &mut IntoIter,
+    variants: &mut LinkedHashMap<String, Variant>,
+) -> String {
     let Some(TokenTree::Ident(lit)) = token_iter.next() else {
         panic!("Trying to parse language default enum name, a ident, but got non ident.");
     };
@@ -234,12 +245,16 @@ fn parse_default_variant(token_iter: &mut IntoIter, variants: &mut LinkedHashMap
         panic!("Trying to parse = after default language enum name, but got non Punct TokenTree");
     };
 
-    assert!((p.as_char() == '='),
-            "Trying to parse = after default language enum name, but got {}",
-            p.as_char()
+    assert!(
+        (p.as_char() == '='),
+        "Trying to parse = after default language enum name, but got {}",
+        p.as_char()
     );
 
-    assert!(!default_variant.is_empty(), "Trying to parse language default variant but got empty token tree.");
+    assert!(
+        !default_variant.is_empty(),
+        "Trying to parse language default variant but got empty token tree."
+    );
 
     let Some(TokenTree::Literal(lit)) = token_iter.next() else {
         panic!("Trying to parse language default file path, a literal, but got non literal.");
@@ -249,10 +264,14 @@ fn parse_default_variant(token_iter: &mut IntoIter, variants: &mut LinkedHashMap
         panic!("Trying to parse ; after language default file path, but got non Punct TokenTree");
     };
 
-    assert_eq!(p.as_char(), ';', "Trying to parse ; after language default file path, but got {}", p.as_char());
+    assert_eq!(
+        p.as_char(),
+        ';',
+        "Trying to parse ; after language default file path, but got {}",
+        p.as_char()
+    );
 
     let default_path = lit.to_string();
-
 
     variants.insert(
         default_variant.clone(),
@@ -272,10 +291,12 @@ fn parse_default_variant(token_iter: &mut IntoIter, variants: &mut LinkedHashMap
 fn read_property_files(variants: &mut LinkedHashMap<String, Variant>) {
     for (_, variant) in variants {
         let path = Path::new(&variant.path[1..variant.path.len() - 1]);
-        let mut prop_file_reader = BufReader::new(
-            File::open(path).unwrap_or_else(|_| panic!("Failed to open file {} for language {}",
-                                                       variant.path, variant.name)),
-        );
+        let mut prop_file_reader = BufReader::new(File::open(path).unwrap_or_else(|_| {
+            panic!(
+                "Failed to open file {} for language {}",
+                variant.path, variant.name
+            )
+        }));
 
         variant.properties = match jprop::parse_utf8_to_map(&mut prop_file_reader) {
             Ok(props) => props,
@@ -285,7 +306,11 @@ fn read_property_files(variants: &mut LinkedHashMap<String, Variant>) {
 }
 
 ///Generates the output of the proc macro.
-fn generate_output(language_name: &String, default_variant: &String, variants: &LinkedHashMap<String, Variant>) -> String {
+fn generate_output(
+    language_name: &String,
+    default_variant: &String,
+    variants: &LinkedHashMap<String, Variant>,
+) -> String {
     let max_format_args = find_max_format_index_per_key(variants);
     let all_complexity = find_all_format_indices(variants);
 
@@ -299,7 +324,6 @@ fn generate_output(language_name: &String, default_variant: &String, variants: &
         if k == 0 {
             continue;
         }
-
 
         output_tuple_arg_impl(&mut output, k, "");
         output_tuple_arg_impl(&mut output, k, "&");
@@ -318,18 +342,30 @@ fn generate_output(language_name: &String, default_variant: &String, variants: &
     let var_name_mapping = get_key_to_var_name_mapping(&keys_sorted);
 
     for k in &keys_sorted {
-        let comp = *max_format_args.get(k).expect("unreachable: keys_sorted not in max_format_args");
-        let mapped = var_name_mapping.get(k).expect("unreachable: var_name_mapping not found");
+        let comp = *max_format_args
+            .get(k)
+            .expect("unreachable: keys_sorted not in max_format_args");
+        let mapped = var_name_mapping
+            .get(k)
+            .expect("unreachable: var_name_mapping not found");
         output.push_str(format!("pub static {mapped}: I18NValue<{comp}> = I18NValue(&[").as_str());
         for (_, value) in variants {
-            let prop_val = escape_string_for_source(value.properties.get(k).expect("unreachable: keys_sorted not in Variant.properties"));
+            let prop_val = escape_string_for_source(
+                value
+                    .properties
+                    .get(k)
+                    .expect("unreachable: keys_sorted not in Variant.properties"),
+            );
 
             output.push('(');
             output.push('"');
             output.push_str(prop_val.as_str());
             output.push_str("\",");
 
-            let format_parts = value.properties_split_by_format_args.get(k).expect("unreachable: keys_sorted not in Variant.properties_split_by_format_args");
+            let format_parts = value
+                .properties_split_by_format_args
+                .get(k)
+                .expect("unreachable: keys_sorted not in Variant.properties_split_by_format_args");
             output.push_str("&[");
             for (prefix, index) in format_parts {
                 let prefix = escape_string_for_source(prefix);
@@ -344,7 +380,6 @@ fn generate_output(language_name: &String, default_variant: &String, variants: &
                 }
             }
             output.push(']');
-
 
             output.push_str("),");
         }
@@ -479,7 +514,11 @@ fn generate_i18n_value_struct(variants: &LinkedHashMap<String, Variant>, output:
 }
 
 /// Generates the `set_i18n_language` function.
-fn generate_language_setter(language_name: &String, variants: &LinkedHashMap<String, Variant>, output: &mut String) {
+fn generate_language_setter(
+    language_name: &String,
+    variants: &LinkedHashMap<String, Variant>,
+    output: &mut String,
+) {
     output.push_str(format!("pub fn set_i18n_language(language: {language_name}) {{\n").as_str());
     output.push_str("SELECTION.store(match language {\n");
     for (idx, key) in variants.keys().enumerate() {
@@ -505,9 +544,9 @@ fn escape_string_for_source(input: &str) -> String {
             ' '..='~' => target.push(c),
             other => {
                 target.push_str("\\u{");
-                _= write!(target, "{:X}", other as u64);
+                _ = write!(target, "{:X}", other as u64);
                 target.push('}');
-            },
+            }
         }
     }
     target
@@ -703,7 +742,9 @@ fn find_all_format_indices(variants: &LinkedHashMap<String, Variant>) -> BTreeSe
     res
 }
 
-fn escape_char_in_variable_name(c: char) -> Option<&'static str> {
+/// Escapes a single character for use in a rust variable name.
+/// returns none if the char does not need escaping.
+const fn escape_char_in_variable_name(c: char) -> Option<&'static str> {
     //Want a symbol added? I don't mind. Make a pr.
     Some(match c {
         ' ' => "_SPACE_",
@@ -754,12 +795,73 @@ fn escape_char_in_variable_name(c: char) -> Option<&'static str> {
     })
 }
 
+/// Is a str a rust keyword?
+fn is_keyword(word: &str) -> bool {
+    matches!(
+        word,
+        "_" | "as"
+            | "async"
+            | "await"
+            | "break"
+            | "const"
+            | "continue"
+            | "crate"
+            | "dyn"
+            | "else"
+            | "enum"
+            | "extern"
+            | "false"
+            | "fn"
+            | "for"
+            | "gen"
+            | "if"
+            | "impl"
+            | "in"
+            | "let"
+            | "loop"
+            | "match"
+            | "mod"
+            | "move"
+            | "mut"
+            | "pub"
+            | "ref"
+            | "return "
+            | "self"
+            | "Self"
+            | "static"
+            | "struct"
+            | "super"
+            | "trait"
+            | "true"
+            | "type"
+            | "unsafe"
+            | "use"
+            | "where"
+            | "while"
+            | "abstract"
+            | "become"
+            | "box"
+            | "do"
+            | "final"
+            | "macro"
+            | "override"
+            | "priv"
+            | "try"
+            | "typeof"
+            | "unsized"
+            | "virtual"
+            | "yield"
+    )
+}
+
+/// Escapes variable names to be compatible with characters/names allowed in rust field names.
+/// Provides mapping from prop->var name. The values are guaranteed to be unique.
 fn get_key_to_var_name_mapping(keys: &BTreeSet<String>) -> HashMap<String, String> {
     let mut result = HashMap::new();
     let mut problem_keys = Vec::new();
     let mut used_keys = HashSet::new();
     'next_key: for k in keys {
-        if k == "_" {
+        if is_keyword(k) {
             problem_keys.push(k.clone());
             continue;
         }
